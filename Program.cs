@@ -60,7 +60,8 @@ class Program
             FarModelRelativePath = "VisionPython\\models\\yolov26l_far_bbox_1280.pt"
         };
 
-        string appRoot = AppContext.BaseDirectory;
+        string appRoot = FindAppRoot(AppContext.BaseDirectory);
+        Console.WriteLine($"应用根目录：{appRoot}");
 
         await using IRobot robot = new Rm65Robot(profile);
 
@@ -114,5 +115,19 @@ class Program
                 await gripper.DisposeAsync();
             }
         }
+    }
+
+    private static string FindAppRoot(string baseDirectory)
+    {
+        var dir = new DirectoryInfo(baseDirectory);
+        while (dir != null)
+        {
+            if (Directory.Exists(Path.Combine(dir.FullName, "VisionPython")))
+            {
+                return dir.FullName;
+            }
+            dir = dir.Parent;
+        }
+        return baseDirectory;
     }
 }
