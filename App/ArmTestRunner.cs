@@ -7,31 +7,54 @@ using SharpDX.XInput;
 namespace FruitPickPart.App;
 
 /// <summary>
-/// Step 1 机械臂测试 Runner。
-/// 只验证：连接、读位姿、Y 复位、B 停止、右扳机+左摇杆 XYZ 小步运动、Q 退出。
+/// Step 2 机械臂 + 夹爪测试 Runner。
+/// 验证：连接、读位姿、Y 复位、B 停止、右扳机+左摇杆 XYZ 小步运动、LB/RB 开闭夹爪、Q 退出。
 /// </summary>
 public sealed class ArmTestRunner
 {
     private readonly IRobot _robot;
+    private readonly IGripper? _gripper;
     private readonly RobotProfile _profile;
     private readonly JoystickInputReader _joystick = new();
 
     private Controller? _controller;
     private bool _exitRequested;
 
-    public ArmTestRunner(IRobot robot, RobotProfile profile)
+    public ArmTestRunner(IRobot robot, RobotProfile profile, IGripper? gripper = null)
     {
         _robot = robot ?? throw new ArgumentNullException(nameof(robot));
         _profile = profile ?? throw new ArgumentNullException(nameof(profile));
+        _gripper = gripper;
     }
 
     public async Task RunAsync(CancellationToken ct = default)
     {
         try
         {
-            Console.WriteLine("正在连接机械臂...");
-            await _robot.ConnectAsync(ct);
-            Console.WriteLine($"机械臂已连接：{_profile.DisplayName} ({_profile.Ip})");
+            if (!_robot.IsConnected)
+            {
+                Console.WriteLine("正在连接机械臂...");
+                await _robot.ConnectAsync(ct);
+                Console.WriteLine($"机械臂已连接：{_profile.DisplayName} ({_profile.Ip})");
+            }
+            else
+            {
+                Console.WriteLine($"机械臂已连接：{_profile.DisplayName} ({_profile.Ip})");
+            }
+
+            if (_gripper != null && !_gripper.IsConnected)
+            {
+                Console.WriteLine("正在连接夹爪...");
+                await _gripper.ConnectAsync(ct);
+                Console.WriteLine("夹爪 Modbus 已连接。");
+
+                if (_gripper is PgcGripper pgc)
+                {
+                    // PGC 夹爪需要在连接后初始化
+                    // 注意：这里我们无法直接访问 GripperProfile，但 PgcGripper 内部已包含配置
+                    await _gripper.InitializeAsync(ct);
+                }
+            }
 
             var pose = await _robot.GetToolPoseAsync(ct);
             Console.WriteLine($"当前位姿：{pose}");
@@ -53,18 +76,22 @@ public sealed class ArmTestRunner
             }
 
             Console.WriteLine("手柄已连接。");
-            Console.WriteLine("操作说明（均需按住右扳机 RT）：");
-            Console.WriteLine("  左摇杆往前推  -> Base +Y");
-            Console.WriteLine("  左摇杆往后推  -> Base -Y");
-            Console.WriteLine("  左摇杆往右推  -> Base +X");
-            Console.WriteLine("  左摇杆往左推  -> Base -X");
-            Console.WriteLine("  右摇杆往上推  -> Base +Z（向上）");
-            Console.WriteLine("  右摇杆往下推  -> Base -Z（向下）");
-            Console.WriteLine("  单次最大移动：5mm");
-            Console.WriteLine("其他按键：");
-            Console.WriteLine("  Y - 复位到 Home 位置");
-            Console.WriteLine("  B - 急停");
-            Console.WriteLine("  Q - 退出程序");
+            Console.WriteLine("操作说明：");
+            Console.WriteLine("  [遥控移动] 按住右扳机 RT：");
+            Console.WriteLine("    左摇杆往前推  -> Base +Y");
+            Console.WriteLine("    左摇杆往后推  -> Base -Y");
+            Console.WriteLine("    左摇杆往右推  -> Base +X");
+            Console.WriteLine("    左摇杆往左推  -> Base -X");
+            Console.WriteLine("    右摇杆往上推  -> Base +Z（向上）");
+            Console.WriteLine("    右摇杆往下推  -> Base -Z（向下）");
+            Console.WriteLine("    单次最大移动：5mm");
+            Console.WriteLine("  [夹爪控制]");
+            Console.WriteLine("    LB - 打开夹爪");
+            Console.WriteLine("    RB - 关闭夹爪");
+            Console.WriteLine("  [其他]");
+            Console.WriteLine("    Y - 复位到 Home 位置");
+            Console.WriteLine("    B - 急停");
+            Console.WriteLine("    Q - 退出程序");
 
             while (!ct.IsCancellationRequested && !_exitRequested)
             {
@@ -87,6 +114,32 @@ public sealed class ArmTestRunner
                 {
                     Console.WriteLine("[Y] 复位到 Home");
                     await _robot.MoveJointsAsync(_profile.HomeJoints, new MoveOptions { Speed = 15 }, ct);
+                }
+
+                if (pressed.HasFlag(GamepadButtonFlags.LeftShoulder))
+                {
+                    Console.WriteLine("[LB] 打开夹爪");
+                    if (_gripper != null)
+                    {
+                        await _gripper.OpenAsync(cancellationToken: ct);
+                    }
+                    else
+                    {
+                        Console.WriteLine("  [Warning] 未配置夹爪。");
+                    }
+                }
+
+                if (pressed.HasFlag(GamepadButtonFlags.RightShoulder))
+                {
+                    Console.WriteLine("[RB] 关闭夹爪");
+                    if (_gripper != null)
+                    {
+                        await _gripper.CloseAsync(cancellationToken: ct);
+                    }
+                    else
+                    {
+                        Console.WriteLine("  [Warning] 未配置夹爪。");
+                    }
                 }
 
                 // 右扳机完全按下（XInput 范围 0..255）时进入遥控模式

@@ -10,6 +10,12 @@ public interface IRobot : IAsyncDisposable
     /// <summary>机械臂是否已连接。</summary>
     bool IsConnected { get; }
 
+    /// <summary>
+    /// 底层 SDK 句柄。用于创建夹爪 Modbus 传输等需要访问底层 SDK 的组件。
+    /// 注意：此属性是厂商相关的实现细节，应谨慎使用。
+    /// </summary>
+    uint NativeHandle { get; }
+
     /// <summary>连接机械臂。</summary>
     Task ConnectAsync(CancellationToken cancellationToken = default);
 

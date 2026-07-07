@@ -16,6 +16,8 @@ public sealed class Rm65Robot : IRobot
 
     public bool IsConnected { get; private set; }
 
+    public uint NativeHandle => _handle;
+
     public Rm65Robot(RobotProfile profile)
     {
         _profile = profile ?? throw new ArgumentNullException(nameof(profile));
