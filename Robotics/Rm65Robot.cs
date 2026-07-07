@@ -176,10 +176,17 @@ public sealed class Rm65Robot : IRobot
         };
 
         byte v = (byte)Math.Clamp(options.Speed, 1, 100);
-        int ret = ArmAPI.Movel_Cmd(_handle, pose, v, (float)options.BlendingRadius, 0, options.BlockUntilComplete);
+
+        // 优先用 Movej_P_Cmd（关节空间插补到目标位姿），对奇异点和 unreachable pose 更宽容。
+        // 如果调用方指定了直线模式，再回退到 Movel_Cmd。
+        int ret = options.MoveMode == MoveMode.Linear
+            ? ArmAPI.Movel_Cmd(_handle, pose, v, (float)options.BlendingRadius, 0, options.BlockUntilComplete)
+            : ArmAPI.Movej_P_Cmd(_handle, pose, v, (float)options.BlendingRadius, 0, options.BlockUntilComplete);
+
         if (ret != 0)
         {
-            throw new InvalidOperationException($"笛卡尔直线运动失败，返回值={ret}。");
+            string modeName = options.MoveMode == MoveMode.Linear ? "笛卡尔直线" : "关节空间到目标位姿";
+            throw new InvalidOperationException($"{modeName}运动失败，返回值={ret}。目标位姿：{target}");
         }
 
         return Task.CompletedTask;
