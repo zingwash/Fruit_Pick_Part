@@ -153,7 +153,7 @@ public sealed class Rm65Robot : IRobot
         return Task.CompletedTask;
     }
 
-    public Task MoveToolAsync(Pose3D target, MoveOptions options, CancellationToken cancellationToken = default)
+    public async Task MoveToolAsync(Pose3D target, MoveOptions options, CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         EnsureConnected();
@@ -183,12 +183,54 @@ public sealed class Rm65Robot : IRobot
 
         if (options.BlockUntilComplete)
         {
-            // RM65 的 CANFD 运动接口没有直接阻塞参数，简单等待。
-            // 后续可替换为查询到位姿收敛。
-            Thread.Sleep(200);
+            await WaitUntilPoseReachedAsync(target, cancellationToken);
         }
+    }
 
-        return Task.CompletedTask;
+    private async Task WaitUntilPoseReachedAsync(Pose3D target, CancellationToken cancellationToken)
+    {
+        const double positionThresholdM = 0.002;   // 2mm
+        const double orientationThresholdRad = 0.05; // ~2.9deg
+        const int pollIntervalMs = 50;
+        const int timeoutMs = 30000;
+
+        var startTime = Environment.TickCount64;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (Environment.TickCount64 - startTime > timeoutMs)
+            {
+                Console.WriteLine($"[Warning] 等待到位超时，目标：{target}");
+                break;
+            }
+
+            Pose3D current = await GetToolPoseAsync(cancellationToken);
+            double positionError = Math.Sqrt(
+                (current.X - target.X) * (current.X - target.X) +
+                (current.Y - target.Y) * (current.Y - target.Y) +
+                (current.Z - target.Z) * (current.Z - target.Z));
+
+            double orientationError = Math.Sqrt(
+                AngleDifference(current.Rx, target.Rx) * AngleDifference(current.Rx, target.Rx) +
+                AngleDifference(current.Ry, target.Ry) * AngleDifference(current.Ry, target.Ry) +
+                AngleDifference(current.Rz, target.Rz) * AngleDifference(current.Rz, target.Rz));
+
+            if (positionError < positionThresholdM && orientationError < orientationThresholdRad)
+            {
+                break;
+            }
+
+            await Task.Delay(pollIntervalMs, cancellationToken);
+        }
+    }
+
+    private static double AngleDifference(double a, double b)
+    {
+        double diff = a - b;
+        while (diff > Math.PI) diff -= 2 * Math.PI;
+        while (diff < -Math.PI) diff += 2 * Math.PI;
+        return diff;
     }
 
     public Task StopAsync(CancellationToken cancellationToken = default)
