@@ -1,5 +1,6 @@
 using FruitPickPart.App;
 using FruitPickPart.Configuration;
+using FruitPickPart.Perception;
 using FruitPickPart.Robotics;
 
 namespace FruitPickPart;
@@ -8,7 +9,7 @@ class Program
 {
     static async Task Main(string[] args)
     {
-        Console.WriteLine("=== FruitPickPart Step 2: 机械臂 + 夹爪测试 ===");
+        Console.WriteLine("=== FruitPickPart Step 3: 机械臂 + 夹爪 + 视觉测试 ===");
         Console.WriteLine("按 Q 可退出程序。");
         Console.WriteLine();
 
@@ -43,6 +44,24 @@ class Program
             ActionDelayMs = 300
         };
 
+        var cameraProfile = new CameraProfile
+        {
+            Name = "D435_Current",
+            Serial = "243622071729",
+            Width = 1280,
+            Height = 720,
+            Fps = 30
+        };
+
+        var visionModelProfile = new VisionModelProfile
+        {
+            Name = "YoloV26L_Current",
+            NearModelRelativePath = "VisionPython\\models\\yolov26l_near_point_1280.pt",
+            FarModelRelativePath = "VisionPython\\models\\yolov26l_far_bbox_1280.pt"
+        };
+
+        string appRoot = AppContext.BaseDirectory;
+
         await using IRobot robot = new Rm65Robot(profile);
 
         Console.WriteLine("正在连接机械臂...");
@@ -51,6 +70,7 @@ class Program
 
         // 夹爪传输层依赖机械臂底层句柄，必须在机械臂连接后创建
         IGripper? gripper = null;
+        IPerception? perception = null;
         try
         {
             if (gripperProfile.Enabled)
@@ -64,7 +84,12 @@ class Program
                 gripper = new PgcGripper(transport, gripperProfile);
             }
 
-            var runner = new ArmTestRunner(robot, profile, gripper);
+            // 启动 Python 视觉 worker
+            Console.WriteLine("正在启动 Python 视觉 worker...");
+            perception = new PythonWorkerPerception(appRoot, cameraProfile, visionModelProfile);
+            Console.WriteLine("视觉 worker 已启动。");
+
+            var runner = new ArmTestRunner(robot, profile, gripper, perception);
 
             using var cts = new CancellationTokenSource();
             Console.CancelKeyPress += (sender, e) =>
@@ -77,6 +102,12 @@ class Program
         }
         finally
         {
+            if (perception != null)
+            {
+                Console.WriteLine("关闭视觉 worker...");
+                await perception.DisposeAsync();
+            }
+
             if (gripper != null)
             {
                 Console.WriteLine("断开夹爪连接...");

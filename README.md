@@ -76,9 +76,9 @@ Fruit_Pick_Part/
 
 ## 当前阶段
 
-> **Step 1：机械臂能动起来**
+> **Step 3：Python worker 能启动、返回检测结果**
 >
-> 先只关注 `Robotics/IRobot.cs`、`Robotics/Rm65Robot.cs`、`Configuration/RobotProfile.cs`、`Input/JoystickInputReader.cs`、`App/Runner.cs`。
+> 先只关注 `Configuration/CameraProfile.cs`、`Configuration/HandEyeProfile.cs`、`Configuration/VisionModelProfile.cs`、`Perception/IPerception.cs`、`Perception/DetectionResult.cs`、`Perception/PythonWorkerPerception.cs`、`VisionPython/vision_worker.py`。
 
 ### Step 1 手柄映射
 

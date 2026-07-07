@@ -36,5 +36,6 @@ public sealed class RobotProfile
     public bool AllowMotion { get; set; } = true;
 
     /// <summary>Home/Reset 关节角（单位：度）。</summary>
-    public double[] HomeJoints { get; set; } = new[] { -1.146, -70.683, 95.52, -2.926, 87.114, -2.168 };
+    //public double[] HomeJoints { get; set; } = new[] { -1.146, -70.683, 95.52, -2.926, 87.114, -2.168 };
+    public double[] HomeJoints { get; set; } = new[] { -1.086, -39.169, 68.833, -2.046, 61.31, -180.265 };
 }

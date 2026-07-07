@@ -1,6 +1,7 @@
 using FruitPickPart.Configuration;
 using FruitPickPart.Geometry;
 using FruitPickPart.Input;
+using FruitPickPart.Perception;
 using FruitPickPart.Robotics;
 using SharpDX.XInput;
 
@@ -14,17 +15,19 @@ public sealed class ArmTestRunner
 {
     private readonly IRobot _robot;
     private readonly IGripper? _gripper;
+    private readonly IPerception? _perception;
     private readonly RobotProfile _profile;
     private readonly JoystickInputReader _joystick = new();
 
     private Controller? _controller;
     private bool _exitRequested;
 
-    public ArmTestRunner(IRobot robot, RobotProfile profile, IGripper? gripper = null)
+    public ArmTestRunner(IRobot robot, RobotProfile profile, IGripper? gripper = null, IPerception? perception = null)
     {
         _robot = robot ?? throw new ArgumentNullException(nameof(robot));
         _profile = profile ?? throw new ArgumentNullException(nameof(profile));
         _gripper = gripper;
+        _perception = perception;
     }
 
     public async Task RunAsync(CancellationToken ct = default)
@@ -88,6 +91,9 @@ public sealed class ArmTestRunner
             Console.WriteLine("  [夹爪控制]");
             Console.WriteLine("    LB - 打开夹爪");
             Console.WriteLine("    RB - 关闭夹爪");
+            Console.WriteLine("  [视觉测试]");
+            Console.WriteLine("    F - 请求 far bbox 检测");
+            Console.WriteLine("    N - 请求 near pose line 检测");
             Console.WriteLine("  [其他]");
             Console.WriteLine("    Y - 复位到 Home 位置");
             Console.WriteLine("    B - 急停");
@@ -95,10 +101,23 @@ public sealed class ArmTestRunner
 
             while (!ct.IsCancellationRequested && !_exitRequested)
             {
-                if (Console.KeyAvailable && Console.ReadKey(intercept: true).Key == ConsoleKey.Q)
+                if (Console.KeyAvailable)
                 {
-                    _exitRequested = true;
-                    break;
+                    var key = Console.ReadKey(intercept: true).Key;
+                    if (key == ConsoleKey.Q)
+                    {
+                        _exitRequested = true;
+                        break;
+                    }
+
+                    if (key == ConsoleKey.F)
+                    {
+                        await TestFarDetectionAsync(ct);
+                    }
+                    else if (key == ConsoleKey.N)
+                    {
+                        await TestNearDetectionAsync(ct);
+                    }
                 }
 
                 GamepadButtonFlags pressed = _joystick.ReadPressedButtons(_controller);
@@ -165,6 +184,53 @@ public sealed class ArmTestRunner
             Console.WriteLine("断开机械臂连接...");
             await _robot.StopAsync(ct);
             await _robot.DisconnectAsync(ct);
+        }
+    }
+
+    private async Task TestFarDetectionAsync(CancellationToken ct)
+    {
+        if (_perception == null)
+        {
+            Console.WriteLine("[Warning] 未配置视觉感知。");
+            return;
+        }
+
+        Console.WriteLine("[F] 请求 far bbox 检测...");
+        var result = await _perception.CaptureFarAsync(ct);
+        if (result == null)
+        {
+            Console.WriteLine("  far 检测失败或无结果。");
+            return;
+        }
+
+        Console.WriteLine($"  trusted={result.Trusted}, count={result.TrustedCount}, selected={result.SelectedIndex}");
+        if (result.SelectedTarget != null)
+        {
+            Console.WriteLine($"  selected center: {result.SelectedTarget.Center}");
+        }
+    }
+
+    private async Task TestNearDetectionAsync(CancellationToken ct)
+    {
+        if (_perception == null)
+        {
+            Console.WriteLine("[Warning] 未配置视觉感知。");
+            return;
+        }
+
+        Console.WriteLine("[N] 请求 near pose line 检测...");
+        var result = await _perception.CaptureNearAsync(ct);
+        if (result == null)
+        {
+            Console.WriteLine("  near 检测失败或无结果。");
+            return;
+        }
+
+        Console.WriteLine($"  trusted={result.Trusted}, count={result.TrustedCount}");
+        if (result.SelectedTarget != null)
+        {
+            Console.WriteLine($"  selected center: {result.SelectedTarget.Center}");
+            Console.WriteLine($"  keypoints: {result.SelectedTarget.Keypoints.Count}");
         }
     }
 
