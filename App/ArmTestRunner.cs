@@ -3,13 +3,14 @@ using FruitPickPart.Geometry;
 using FruitPickPart.Input;
 using FruitPickPart.Perception;
 using FruitPickPart.Robotics;
+using FruitPickPart.Tasks;
 using SharpDX.XInput;
 
 namespace FruitPickPart.App;
 
 /// <summary>
-/// Step 4 机械臂 + 夹爪 + 视觉 + 坐标转换测试 Runner。
-/// 验证：连接、读位姿、手柄遥控 XYZ、夹爪开闭、视觉检测、像素/深度 → Base 坐标转换。
+/// Step 5 机械臂 + 夹爪 + 视觉 + 坐标转换 + 固定点位采摘测试 Runner。
+/// 验证：连接、读位姿、手柄遥控 XYZ、夹爪开闭、视觉检测、像素/深度 → Base、固定点位任务。
 /// </summary>
 public sealed class ArmTestRunner
 {
@@ -17,6 +18,7 @@ public sealed class ArmTestRunner
     private readonly IGripper? _gripper;
     private readonly IPerception? _perception;
     private readonly ICoordinateTransformer? _transformer;
+    private readonly IPickTask? _pickTask;
     private readonly RobotProfile _profile;
     private readonly JoystickInputReader _joystick = new();
 
@@ -31,13 +33,14 @@ public sealed class ArmTestRunner
     private CancellationTokenSource? _continuousNearDetectionCts;
     private Task? _continuousNearDetectionTask;
 
-    public ArmTestRunner(IRobot robot, RobotProfile profile, IGripper? gripper = null, IPerception? perception = null, ICoordinateTransformer? transformer = null)
+    public ArmTestRunner(IRobot robot, RobotProfile profile, IGripper? gripper = null, IPerception? perception = null, ICoordinateTransformer? transformer = null, IPickTask? pickTask = null)
     {
         _robot = robot ?? throw new ArgumentNullException(nameof(robot));
         _profile = profile ?? throw new ArgumentNullException(nameof(profile));
         _gripper = gripper;
         _perception = perception;
         _transformer = transformer;
+        _pickTask = pickTask;
     }
 
     public async Task RunAsync(CancellationToken ct = default)
@@ -106,6 +109,8 @@ public sealed class ArmTestRunner
             Console.WriteLine("    N - 请求 near pose line 检测");
             Console.WriteLine("    C - 切换连续 far bbox 检测");
             Console.WriteLine("    V - 切换连续 near pose line 检测");
+            Console.WriteLine("  [任务]");
+            Console.WriteLine("    P - 执行一次固定点位采摘任务");
             Console.WriteLine("  [其他]");
             Console.WriteLine("    Y - 复位到 Home 位置");
             Console.WriteLine("    B - 急停");
@@ -137,6 +142,10 @@ public sealed class ArmTestRunner
                     else if (key == ConsoleKey.V)
                     {
                         await ToggleContinuousNearDetectionAsync(ct);
+                    }
+                    else if (key == ConsoleKey.P)
+                    {
+                        await RunPickTaskAsync(ct);
                     }
                 }
 
@@ -303,6 +312,31 @@ public sealed class ArmTestRunner
         if (basePose != null)
         {
             Console.WriteLine($"  {label} in Base: {basePose}");
+        }
+    }
+
+    private async Task RunPickTaskAsync(CancellationToken ct)
+    {
+        if (_pickTask == null)
+        {
+            Console.WriteLine("[Warning] 未配置采摘任务。");
+            return;
+        }
+
+        try
+        {
+            Console.WriteLine($"[P] 执行任务：{_pickTask.Name}");
+            await _pickTask.ExecuteAsync(_robot, _gripper, _perception, _transformer, ct);
+            Console.WriteLine($"[P] 任务完成：{_pickTask.Name}");
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("[P] 任务已取消。");
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[P] 任务执行出错：{ex.Message}");
         }
     }
 

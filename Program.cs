@@ -3,6 +3,7 @@ using FruitPickPart.Configuration;
 using FruitPickPart.Geometry;
 using FruitPickPart.Perception;
 using FruitPickPart.Robotics;
+using FruitPickPart.Tasks;
 using Microsoft.Extensions.Configuration;
 
 namespace FruitPickPart;
@@ -11,7 +12,7 @@ class Program
 {
     static async Task Main(string[] args)
     {
-        Console.WriteLine("=== FruitPickPart Step 4: 像素/深度 → Base 坐标转换 ===");
+        Console.WriteLine("=== FruitPickPart Step 5: 固定点位采摘循环 ===");
         Console.WriteLine("按 Q 可退出程序。");
         Console.WriteLine();
 
@@ -33,6 +34,8 @@ class Program
             ?? throw new InvalidOperationException("找不到 HandEyeProfile 配置。");
         var visionModelProfile = configuration.GetSection("VisionModelProfile").Get<VisionModelProfile>()
             ?? throw new InvalidOperationException("找不到 VisionModelProfile 配置。");
+        var taskProfile = configuration.GetSection("TaskProfile").Get<TaskProfile>()
+            ?? throw new InvalidOperationException("找不到 TaskProfile 配置。");
 
         await using IRobot robot = new Rm65Robot(profile);
 
@@ -44,6 +47,7 @@ class Program
         IGripper? gripper = null;
         IPerception? perception = null;
         ICoordinateTransformer? transformer = null;
+        IPickTask? pickTask = null;
         try
         {
             if (gripperProfile.Enabled)
@@ -67,7 +71,10 @@ class Program
             perception = new PythonWorkerPerception(appRoot, cameraProfile, visionModelProfile);
             Console.WriteLine("视觉 worker 已启动。");
 
-            var runner = new ArmTestRunner(robot, profile, gripper, perception, transformer);
+            // 创建固定点位采摘任务
+            pickTask = new FixedWaypointTask(taskProfile);
+
+            var runner = new ArmTestRunner(robot, profile, gripper, perception, transformer, pickTask);
 
             using var cts = new CancellationTokenSource();
             Console.CancelKeyPress += (sender, e) =>

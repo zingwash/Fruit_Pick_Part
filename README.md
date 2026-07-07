@@ -76,12 +76,12 @@ Fruit_Pick_Part/
 
 ## 当前阶段
 
-> **Step 4 已完成，准备进入 Step 5：固定点位采摘循环**
+> **Step 5 已完成，准备进入 Step 6：两阶段视觉采摘循环**
 >
-> Step 4 验证项已跑通：加载相机内参和手眼标定，把 `ImagePoint`（u, v, depth）通过 `CameraToRobotTransformer` 转成 Base 坐标系下的 `Pose3D`。
+> Step 5 验证项已跑通：实现 `IPickTask` 和 `FixedWaypointTask`，按 `TaskProfile` 里的路径点依次运动，并在指定点执行夹爪开闭。
 >
-> 下一步重点实现 `Tasks/IPickTask.cs` 与具体采摘任务（如 `FixedWaypointTask.cs`），让机械臂按固定点位或视觉结果完成采摘循环。
-> 先只关注 `Tasks/IPickTask.cs`、`Tasks/FixedWaypointTask.cs`、`App/Runner.cs`。
+> 下一步重点实现 `TwoStageVisionTask`：先用 far bbox 粗定位并靠近，再用 near pose line 精定位并完成采摘。
+> 先只关注 `Tasks/TwoStageVisionTask.cs`、`Tasks/ITargetSelector.cs`、`App/ArmTestRunner.cs`。
 
 ### Step 1 手柄映射
 
@@ -133,6 +133,15 @@ Fruit_Pick_Part/
 - 在 [Configuration/VisionModelProfile.cs](Configuration/VisionModelProfile.cs) 中新增 `ShowDebugView` 配置项。
 - [Perception/PythonWorkerPerception.cs](Perception/PythonWorkerPerception.cs) 在启动 Python worker 时，根据配置追加 `--debug-view` 参数。
 - 调试窗口为可调整大小的 1920x540 窗口，左侧显示 **原始相机帧 + 原始坐标标注**，右侧显示 **旋转 180° 后的推理帧 + 旋转坐标标注**，并在顶部文字显示当前模型（`far_bbox` / `near_pose_line`）、模式、trusted 状态和选中目标。
+
+### 2026-07-08：Step 5 固定点位采摘循环
+
+- 新增 [Configuration/TaskProfile.cs](Configuration/TaskProfile.cs)：配置固定点位任务的循环次数、路径点、速度、夹爪动作。
+- 新增 [Tasks/IPickTask.cs](Tasks/IPickTask.cs)：采摘任务抽象接口。
+- 新增 [Tasks/FixedWaypointTask.cs](Tasks/FixedWaypointTask.cs)：按 `TaskProfile.Steps` 依次运动，并在指定 waypoint 执行 `open`/`close` 夹爪动作。
+- [Program.cs](Program.cs) 加载 `TaskProfile`，创建 `FixedWaypointTask` 并传给 `ArmTestRunner`。
+- [App/ArmTestRunner.cs](App/ArmTestRunner.cs) 新增 **P** 键执行一次固定点位任务。
+- [appsettings.json](appsettings.json) 新增 `TaskProfile`，包含一组示例 pick-place 路径点（**需根据实际工作空间修改后再运行**）。
 
 ### 2026-07-08：Step 4 像素/深度 → Base 坐标转换
 
