@@ -165,3 +165,33 @@ Fruit_Pick_Part/
   - [Configuration/VisionModelProfile.cs](Configuration/VisionModelProfile.cs) 新增 `RotateImage180` 配置项；[Perception/PythonWorkerPerception.cs](Perception/PythonWorkerPerception.cs) 根据配置给 Python worker 传参。
 - **效果**：相机倒置后，`T_end_camera` 完全不用改；C# 拿到的像素坐标仍是原始相机坐标系，可继续用原手眼标定做像素 → Base 转换。
 - 在 [appsettings.json](appsettings.json) 中设置 `"RotateImage180": true` 即可启用。
+
+## Git 版本标签
+
+本项目使用 Git 标签标记每个阶段的可运行版本。常用操作：
+
+```bash
+# 查看所有标签
+git tag
+
+# 查看当前标签指向的提交
+git show step5
+
+# 回到 Step 4 的版本（只读查看，不修改当前分支）
+git checkout step4
+
+# 回到 Step 5 的版本
+git checkout step5
+
+# 回到最新开发状态
+git checkout main
+```
+
+当前已标记的版本：
+
+| 标签 | 说明 |
+|---|---|
+| `step4` | Step 4 完成：像素/深度 → Base 坐标转换 |
+| `step5` | Step 5 完成：固定点位采摘循环可运行 |
+
+> 注意：`git checkout <tag>` 会让仓库进入 "detached HEAD" 状态，适合查看或临时运行。如果想基于某个标签继续开发，建议切回 `main` 分支后再修改。
