@@ -1,0 +1,21 @@
+# .NET build outputs
+bin/
+obj/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Runtime outputs
+VisionPython/outputs/
+*.log
