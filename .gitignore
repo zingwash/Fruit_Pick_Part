@@ -19,3 +19,7 @@ Desktop.ini
 # Runtime outputs
 VisionPython/outputs/
 *.log
+
+# YOLO model weights
+*.pt
+*.onnx

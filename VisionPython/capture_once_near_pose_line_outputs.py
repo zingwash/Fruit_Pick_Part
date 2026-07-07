@@ -82,6 +82,13 @@ def rounded_float(value: Any, digits: int = 4) -> float:
     return round(float(value), digits)
 
 
+def convert_uv_rotated_to_original(
+    u: float, v: float, image_width: int, image_height: int
+) -> tuple[int, int]:
+    """把推理用旋转 180° 后的图像坐标转回原始相机图像坐标。"""
+    return int(round(image_width - 1 - u)), int(round(image_height - 1 - v))
+
+
 def get_depth_z(depth_frame: Any, u: float | None, v: float | None, width: int, height: int, confidence: float, trust_conf: float) -> tuple[float | None, float | None, str, dict[str, Any]]:
     empty_window = {
         "size": DEPTH_WINDOW_SIZE,
@@ -210,6 +217,7 @@ def extract_grape_outputs(
     trust_conf: float,
     z_outlier_threshold: float,
     core_point_ratio_k0_to_k2: float,
+    rotate_180: bool = False,
 ) -> list[dict[str, Any]]:
     if result.boxes is None or len(result.boxes) == 0:
         return []
@@ -235,6 +243,11 @@ def extract_grape_outputs(
         center_x = (float(x1) + float(x2)) / 2.0
         center_y = (float(y1) + float(y2)) / 2.0
 
+        if rotate_180:
+            center_x, center_y = convert_uv_rotated_to_original(
+                center_x, center_y, image_width, image_height
+            )
+
         box_center = make_point(
             center_x,
             center_y,
@@ -252,6 +265,12 @@ def extract_grape_outputs(
                 kp_v = float(keypoint_xy[i][keypoint_index][1])
             if keypoint_conf is not None and i < len(keypoint_conf) and len(keypoint_conf[i]) > keypoint_index:
                 kp_conf = float(keypoint_conf[i][keypoint_index])
+
+            if rotate_180 and kp_u is not None and kp_v is not None:
+                kp_u, kp_v = convert_uv_rotated_to_original(
+                    kp_u, kp_v, image_width, image_height
+                )
+
             keypoints.append(make_point(
                 kp_u,
                 kp_v,

@@ -10,6 +10,9 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Configuration" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.0" />
     <PackageReference Include="SharpDX.XInput" Version="4.2.0" />
   </ItemGroup>
 
@@ -17,6 +20,8 @@
     <None Include="Vendor\RealMan\x86\RM_Base.dll"
           CopyToOutputDirectory="PreserveNewest"
           Link="RM_Base.dll" />
+    <None Include="appsettings.json"
+          CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

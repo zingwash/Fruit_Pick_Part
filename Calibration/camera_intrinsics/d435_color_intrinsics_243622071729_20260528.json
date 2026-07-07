@@ -1,0 +1,195 @@
+{
+  "camera_model": "D435",
+  "serial": "243622071729",
+  "stream": "color",
+  "resolution": [
+    1280,
+    720
+  ],
+  "board_inner_corners": [
+    10,
+    9
+  ],
+  "square_size_m": 0.028,
+  "image_dir": "C:\\Users\\Yande\\Desktop\\向同学_个人文件总库\\01_项目与实践\\01_当前主线项目\\葡萄采摘机器人\\工程代码-总\\rm65-pickframe-teleop-mvp-v1.0\\_dev_test\\yinzhi\\xyd\\recalibration_work\\sessions\\20260528_v3_d435_243622071729_full_calibration\\data\\rgb_intrinsics_images",
+  "total_images": 30,
+  "used_images": 30,
+  "rms_reprojection_error_px": 0.253234220230201,
+  "mean_per_image_error_px": 0.026294511150650592,
+  "camera_matrix": [
+    [
+      915.4956972869871,
+      0.0,
+      662.0263877499224
+    ],
+    [
+      0.0,
+      915.7457469058315,
+      375.1798593123008
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "dist_coeffs": [
+    0.12366788449091506,
+    -0.19033229793541045,
+    -0.0040920789732565984,
+    0.000946641716063302,
+    -0.07238460759428589
+  ],
+  "per_image": [
+    {
+      "image": "rgb_intrinsics_000_ok_20260528_162349_068889.png",
+      "used": true,
+      "reprojection_error_px": 0.02150720026360879
+    },
+    {
+      "image": "rgb_intrinsics_001_ok_20260528_162356_761496.png",
+      "used": true,
+      "reprojection_error_px": 0.02174085375640746
+    },
+    {
+      "image": "rgb_intrinsics_002_ok_20260528_162401_630049.png",
+      "used": true,
+      "reprojection_error_px": 0.020919645287081973
+    },
+    {
+      "image": "rgb_intrinsics_003_ok_20260528_162404_319005.png",
+      "used": true,
+      "reprojection_error_px": 0.019501014575801192
+    },
+    {
+      "image": "rgb_intrinsics_004_ok_20260528_162409_686214.png",
+      "used": true,
+      "reprojection_error_px": 0.025114923890734362
+    },
+    {
+      "image": "rgb_intrinsics_005_ok_20260528_162415_442677.png",
+      "used": true,
+      "reprojection_error_px": 0.023843999353457903
+    },
+    {
+      "image": "rgb_intrinsics_006_ok_20260528_162418_624670.png",
+      "used": true,
+      "reprojection_error_px": 0.039905319552503135
+    },
+    {
+      "image": "rgb_intrinsics_007_ok_20260528_162424_957828.png",
+      "used": true,
+      "reprojection_error_px": 0.02981099975985959
+    },
+    {
+      "image": "rgb_intrinsics_008_ok_20260528_162430_446518.png",
+      "used": true,
+      "reprojection_error_px": 0.02388093130860272
+    },
+    {
+      "image": "rgb_intrinsics_009_ok_20260528_162432_801903.png",
+      "used": true,
+      "reprojection_error_px": 0.026352084384224338
+    },
+    {
+      "image": "rgb_intrinsics_010_ok_20260528_162434_879717.png",
+      "used": true,
+      "reprojection_error_px": 0.022339168644471573
+    },
+    {
+      "image": "rgb_intrinsics_011_ok_20260528_162438_875438.png",
+      "used": true,
+      "reprojection_error_px": 0.024794454965112792
+    },
+    {
+      "image": "rgb_intrinsics_012_ok_20260528_162444_816752.png",
+      "used": true,
+      "reprojection_error_px": 0.02469652453763484
+    },
+    {
+      "image": "rgb_intrinsics_013_ok_20260528_162448_240062.png",
+      "used": true,
+      "reprojection_error_px": 0.022121173705321642
+    },
+    {
+      "image": "rgb_intrinsics_014_ok_20260528_162453_512528.png",
+      "used": true,
+      "reprojection_error_px": 0.02779751500092857
+    },
+    {
+      "image": "rgb_intrinsics_015_ok_20260528_162455_671613.png",
+      "used": true,
+      "reprojection_error_px": 0.022510214947051813
+    },
+    {
+      "image": "rgb_intrinsics_016_ok_20260528_162526_313156.png",
+      "used": true,
+      "reprojection_error_px": 0.02380610361780578
+    },
+    {
+      "image": "rgb_intrinsics_017_ok_20260528_163322_184461.png",
+      "used": true,
+      "reprojection_error_px": 0.0296900803684921
+    },
+    {
+      "image": "rgb_intrinsics_018_ok_20260528_163335_740761.png",
+      "used": true,
+      "reprojection_error_px": 0.022030417001606562
+    },
+    {
+      "image": "rgb_intrinsics_019_ok_20260528_163406_446131.png",
+      "used": true,
+      "reprojection_error_px": 0.03451094333356787
+    },
+    {
+      "image": "rgb_intrinsics_020_ok_20260528_163410_493263.png",
+      "used": true,
+      "reprojection_error_px": 0.03399219911416662
+    },
+    {
+      "image": "rgb_intrinsics_021_ok_20260528_163413_066201.png",
+      "used": true,
+      "reprojection_error_px": 0.029406487941287293
+    },
+    {
+      "image": "rgb_intrinsics_022_ok_20260528_163415_826121.png",
+      "used": true,
+      "reprojection_error_px": 0.024954859445206538
+    },
+    {
+      "image": "rgb_intrinsics_023_ok_20260528_163420_578495.png",
+      "used": true,
+      "reprojection_error_px": 0.025030106270416477
+    },
+    {
+      "image": "rgb_intrinsics_024_ok_20260528_163430_938093.png",
+      "used": true,
+      "reprojection_error_px": 0.027368092502173126
+    },
+    {
+      "image": "rgb_intrinsics_025_ok_20260528_163443_566815.png",
+      "used": true,
+      "reprojection_error_px": 0.024928210498448795
+    },
+    {
+      "image": "rgb_intrinsics_026_ok_20260528_163447_105232.png",
+      "used": true,
+      "reprojection_error_px": 0.029471275052783852
+    },
+    {
+      "image": "rgb_intrinsics_027_ok_20260528_163456_812320.png",
+      "used": true,
+      "reprojection_error_px": 0.025540123005345212
+    },
+    {
+      "image": "rgb_intrinsics_028_ok_20260528_163511_345525.png",
+      "used": true,
+      "reprojection_error_px": 0.02726565767236561
+    },
+    {
+      "image": "rgb_intrinsics_029_ok_20260528_163523_401982.png",
+      "used": true,
+      "reprojection_error_px": 0.034004754763049316
+    }
+  ]
+}

@@ -67,12 +67,15 @@ def log(message: str) -> None:
     print(f"[VisionWorker] {message}", file=sys.stderr, flush=True)
 
 
+DEBUG_WINDOW_NAME = "VisionWorker color"
+
+
 def show_startup_debug_window(cv2: Any, message: str) -> None:
     canvas = np.zeros((360, 960, 3), dtype=np.uint8)
     cv2.putText(canvas, "VisionWorker STARTING", (30, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
     cv2.putText(canvas, message, (30, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
     cv2.putText(canvas, "Loading models / starting D435, please wait...", (30, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (180, 180, 180), 2)
-    cv2.imshow("VisionWorker color | depth", canvas)
+    cv2.imshow(DEBUG_WINDOW_NAME, canvas)
     cv2.waitKey(1)
 
 
@@ -187,6 +190,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ, help="YOLO 推理尺寸")
     parser.add_argument("--device", type=str, default=None, help="推理设备，例如 cpu、0；默认自动选择")
     parser.add_argument("--debug-view", action="store_true", help="显示实时 color/depth 调试窗口；只在 capture 请求时运行 YOLO 并叠加最近结果")
+    parser.add_argument("--rotate-180", action="store_true", help="相机倒置 180° 时启用：推理前将图像旋转 180°，输出坐标已转回原始相机坐标系")
     return parser.parse_args()
 
 
@@ -207,6 +211,8 @@ class VisionWorker:
             log("initializing debug view")
             import cv2
             self.cv2 = cv2
+            cv2.namedWindow(DEBUG_WINDOW_NAME, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(DEBUG_WINDOW_NAME, 1920, 540)
             show_startup_debug_window(self.cv2, "Import dependencies done")
 
         log(f"loading model: {display_path(model_path)}")
@@ -220,7 +226,10 @@ class VisionWorker:
         self.far_names = dict(self.far_model.names)
         self.latest_grapes: list[dict[str, Any]] = []
         self.latest_output: dict[str, Any] | None = None
+        self.latest_inference_frame: np.ndarray | None = None
         self.latest_mode = "IDLE"
+        if args.rotate_180:
+            log("rotate-180 enabled: inference frame will be rotated 180°, output coords are in original camera frame")
         if self.cv2 is not None:
             show_startup_debug_window(self.cv2, f"Far model loaded: {display_path(far_model_path)}")
 
@@ -262,27 +271,40 @@ class VisionWorker:
             raise RuntimeError("未获取到对齐后的 color/depth frame")
         return np.asanyarray(color_frame.get_data()).copy(), depth_frame
 
-    def update_debug_view(self, frame: np.ndarray, depth_frame: Any) -> None:
-        if self.cv2 is None:
-            return
+    def _annotate_view(
+        self,
+        frame: np.ndarray,
+        label: str,
+        use_original_coords: bool,
+    ) -> np.ndarray:
+        """在图像上叠加检测标注，返回标注后的图像。"""
+        view = frame.copy()
+        frame_h = int(view.shape[0])
+        frame_w = int(view.shape[1])
 
-        color_view = frame.copy()
+        def display_uv(u: float, v: float) -> tuple[int, int]:
+            if use_original_coords:
+                return int(u), int(v)
+            return int(frame_w - 1 - u), int(frame_h - 1 - v)
+
         selected_index = None
         trusted_output = False
         if self.latest_output is not None:
             selected_index = self.latest_output.get("selected_grape_index")
             trusted_output = bool(self.latest_output.get("trusted"))
 
+        model_name = "far_bbox" if self.latest_mode == "FAR" else "near_pose_line"
         header_color = (0, 255, 0) if trusted_output else (0, 255, 255)
-        self.cv2.putText(color_view, f"MODE={self.latest_mode} trusted={trusted_output} selected={selected_index}", (20, 35), self.cv2.FONT_HERSHEY_SIMPLEX, 0.9, header_color, 2)
+        self.cv2.putText(view, f"MODEL={model_name} MODE={self.latest_mode} trusted={trusted_output} selected={selected_index}", (20, 35), self.cv2.FONT_HERSHEY_SIMPLEX, 0.75, header_color, 2)
+        self.cv2.putText(view, label, (20, 68), self.cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
         if self.latest_mode == "FAR":
-            frame_h = int(color_view.shape[0])
-            frame_w = int(color_view.shape[1])
             left = max(0, min(FAR_SAFE_CENTER_U_MIN, frame_w - 1))
             right = max(0, min(FAR_SAFE_CENTER_U_MAX, frame_w - 1))
-            self.cv2.rectangle(color_view, (left, 0), (right, frame_h - 1), (255, 255, 255), 2)
-            self.cv2.putText(color_view, f"far safe center_u [{left},{right}]", (left + 8, 68), self.cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+            if not use_original_coords:
+                left, right = frame_w - 1 - right, frame_w - 1 - left
+            self.cv2.rectangle(view, (left, 0), (right, frame_h - 1), (255, 255, 255), 2)
+            self.cv2.putText(view, f"far safe center_u [{left},{right}]", (left + 8, 95), self.cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         for grape in self.latest_grapes:
             grape_index = grape.get("index")
@@ -296,14 +318,19 @@ class VisionWorker:
                 color = (0, 0, 255) if is_selected else ((0, 255, 0) if trusted else (0, 255, 255))
                 thickness = 3 if is_selected else 2
                 if xyxy is not None:
-                    self.cv2.rectangle(color_view, (int(xyxy[0]), int(xyxy[1])), (int(xyxy[2]), int(xyxy[3])), color, thickness)
-                    self.cv2.putText(color_view, f"far#{grape_index} conf={bbox.get('confidence')}", (int(xyxy[0]), max(20, int(xyxy[1]) - 8)), self.cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+                    x1d, y1d = display_uv(xyxy[0], xyxy[1])
+                    x2d, y2d = display_uv(xyxy[2], xyxy[3])
+                    self.cv2.rectangle(view, (x1d, y1d), (x2d, y2d), color, thickness)
+                    text_x, text_y = min(x1d, x2d), min(y1d, y2d)
+                    self.cv2.putText(view, f"far#{grape_index} conf={bbox.get('confidence')}", (text_x, max(20, text_y - 8)), self.cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
                 if center_uv is not None:
-                    self.cv2.circle(color_view, (int(center_uv[0]), int(center_uv[1])), 5, (0, 0, 255), -1)
-                    self.cv2.putText(color_view, f"far z={bbox.get('center_z')}", (int(center_uv[0]) + 6, int(center_uv[1]) - 6), self.cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                    cud, cvd = display_uv(center_uv[0], center_uv[1])
+                    self.cv2.circle(view, (cud, cvd), 5, (0, 0, 255), -1)
+                    self.cv2.putText(view, f"far z={bbox.get('center_z')}", (cud + 6, cvd - 6), self.cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
                 if top_center_uv is not None:
-                    self.cv2.circle(color_view, (int(top_center_uv[0]), int(top_center_uv[1])), 6, (255, 0, 255), -1)
-                    self.cv2.putText(color_view, "approach_uv", (int(top_center_uv[0]) + 6, int(top_center_uv[1]) - 6), self.cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+                    tud, tvd = display_uv(top_center_uv[0], top_center_uv[1])
+                    self.cv2.circle(view, (tud, tvd), 6, (255, 0, 255), -1)
+                    self.cv2.putText(view, "approach_uv", (tud + 6, tvd - 6), self.cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
                 continue
 
             for key in ("keypoint_0", "keypoint_1", "keypoint_2", "core_point"):
@@ -315,14 +342,31 @@ class VisionWorker:
                 is_trusted_grape = bool(grape.get("trusted"))
                 color = (0, 0, 255) if is_core else ((255, 0, 0) if is_selected or is_trusted_grape else (0, 255, 0))
                 radius = 6 if is_core else 4
-                self.cv2.circle(color_view, (int(uv[0]), int(uv[1])), radius, color, -1)
-                self.cv2.putText(color_view, f"near#{grape_index} {key.replace('keypoint_', 'k')}", (int(uv[0]) + 6, int(uv[1]) - 6), self.cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                ud, vd = display_uv(uv[0], uv[1])
+                self.cv2.circle(view, (ud, vd), radius, color, -1)
+                self.cv2.putText(view, f"near#{grape_index} {key.replace('keypoint_', 'k')}", (ud + 6, vd - 6), self.cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-        depth_image = np.asanyarray(depth_frame.get_data())
-        depth_8u = self.cv2.convertScaleAbs(depth_image, alpha=0.03)
-        depth_color = self.cv2.applyColorMap(depth_8u, self.cv2.COLORMAP_JET)
-        combined = np.hstack((color_view, depth_color))
-        self.cv2.imshow("VisionWorker color | depth", combined)
+        return view
+
+    def update_debug_view(self, frame: np.ndarray, depth_frame: Any) -> None:
+        if self.cv2 is None:
+            return
+
+        use_rotated = self.args.rotate_180 and self.latest_inference_frame is not None
+
+        original_view = self._annotate_view(frame, "ORIGINAL (camera frame)", use_original_coords=True)
+        if use_rotated:
+            rotated_view = self._annotate_view(self.latest_inference_frame, "ROTATED 180 (inference frame)", use_original_coords=False)
+        else:
+            rotated_view = np.rot90(original_view, 2).copy()
+
+        # 双栏并排显示，单张缩放为 960x540，总窗口 1920x540
+        display_w, display_h = 960, 540
+        original_small = self.cv2.resize(original_view, (display_w, display_h))
+        rotated_small = self.cv2.resize(rotated_view, (display_w, display_h))
+        combined = np.hstack((original_small, rotated_small))
+
+        self.cv2.imshow(DEBUG_WINDOW_NAME, combined)
         self.cv2.waitKey(1)
 
     def capture_near_pose_line(self, request: dict[str, Any]) -> tuple[dict[str, Any], int]:
@@ -337,8 +381,9 @@ class VisionWorker:
 
         while frames_processed < max(1, max_frames) and time.monotonic() < deadline:
             frame, depth_frame = self.read_aligned_frame(self.args.frame_timeout_ms)
+            inference_frame = np.rot90(frame, 2).copy() if self.args.rotate_180 else frame
             results = self.model.predict(
-                source=frame,
+                source=inference_frame,
                 conf=float(request.get("conf", self.args.conf)),
                 iou=float(request.get("iou", self.args.iou)),
                 imgsz=int(request.get("imgsz", self.args.imgsz)),
@@ -354,11 +399,13 @@ class VisionWorker:
                 float(request.get("trust_conf", self.args.near_trust_conf)),
                 float(request.get("z_outlier_threshold", self.args.z_outlier_threshold)),
                 float(request.get("core_point_ratio_k0_to_k2", self.args.core_point_ratio_k0_to_k2)),
+                rotate_180=self.args.rotate_180,
             )
             frames_processed += 1
             last_output = build_output(frame, grapes, time.monotonic() - start_time)
             self.latest_grapes = grapes
             self.latest_output = last_output
+            self.latest_inference_frame = inference_frame
             self.latest_mode = "NEAR"
             self.update_debug_view(frame, depth_frame)
             log_capture_frame("near", frames_processed, last_output, start_time)
@@ -391,8 +438,9 @@ class VisionWorker:
 
         while frames_processed < max(1, max_frames) and time.monotonic() < deadline:
             frame, depth_frame = self.read_aligned_frame(self.args.frame_timeout_ms)
+            inference_frame = np.rot90(frame, 2).copy() if self.args.rotate_180 else frame
             results = self.far_model.predict(
-                source=frame,
+                source=inference_frame,
                 conf=float(request.get("conf", 0.25)),
                 iou=float(request.get("iou", self.args.iou)),
                 imgsz=int(request.get("imgsz", self.args.imgsz)),
@@ -406,11 +454,13 @@ class VisionWorker:
                 int(frame.shape[1]),
                 int(frame.shape[0]),
                 float(request.get("trust_conf", self.args.far_trust_conf)),
+                rotate_180=self.args.rotate_180,
             )
             frames_processed += 1
             last_output = build_far_output(frame, grapes, time.monotonic() - start_time, str(request.get("selection_rule", "nearest_center_z")), float(request.get("trust_conf", self.args.far_trust_conf)))
             self.latest_grapes = grapes
             self.latest_output = last_output
+            self.latest_inference_frame = inference_frame
             self.latest_mode = "FAR"
             self.update_debug_view(frame, depth_frame)
             log_capture_frame("far", frames_processed, last_output, start_time)

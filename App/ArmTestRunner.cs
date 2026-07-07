@@ -8,26 +8,36 @@ using SharpDX.XInput;
 namespace FruitPickPart.App;
 
 /// <summary>
-/// Step 2 机械臂 + 夹爪测试 Runner。
-/// 验证：连接、读位姿、Y 复位、B 停止、右扳机+左摇杆 XYZ 小步运动、LB/RB 开闭夹爪、Q 退出。
+/// Step 4 机械臂 + 夹爪 + 视觉 + 坐标转换测试 Runner。
+/// 验证：连接、读位姿、手柄遥控 XYZ、夹爪开闭、视觉检测、像素/深度 → Base 坐标转换。
 /// </summary>
 public sealed class ArmTestRunner
 {
     private readonly IRobot _robot;
     private readonly IGripper? _gripper;
     private readonly IPerception? _perception;
+    private readonly ICoordinateTransformer? _transformer;
     private readonly RobotProfile _profile;
     private readonly JoystickInputReader _joystick = new();
 
     private Controller? _controller;
     private bool _exitRequested;
 
-    public ArmTestRunner(IRobot robot, RobotProfile profile, IGripper? gripper = null, IPerception? perception = null)
+    private bool _continuousFarDetection;
+    private CancellationTokenSource? _continuousFarDetectionCts;
+    private Task? _continuousFarDetectionTask;
+
+    private bool _continuousNearDetection;
+    private CancellationTokenSource? _continuousNearDetectionCts;
+    private Task? _continuousNearDetectionTask;
+
+    public ArmTestRunner(IRobot robot, RobotProfile profile, IGripper? gripper = null, IPerception? perception = null, ICoordinateTransformer? transformer = null)
     {
         _robot = robot ?? throw new ArgumentNullException(nameof(robot));
         _profile = profile ?? throw new ArgumentNullException(nameof(profile));
         _gripper = gripper;
         _perception = perception;
+        _transformer = transformer;
     }
 
     public async Task RunAsync(CancellationToken ct = default)
@@ -94,6 +104,8 @@ public sealed class ArmTestRunner
             Console.WriteLine("  [视觉测试]");
             Console.WriteLine("    F - 请求 far bbox 检测");
             Console.WriteLine("    N - 请求 near pose line 检测");
+            Console.WriteLine("    C - 切换连续 far bbox 检测");
+            Console.WriteLine("    V - 切换连续 near pose line 检测");
             Console.WriteLine("  [其他]");
             Console.WriteLine("    Y - 复位到 Home 位置");
             Console.WriteLine("    B - 急停");
@@ -117,6 +129,14 @@ public sealed class ArmTestRunner
                     else if (key == ConsoleKey.N)
                     {
                         await TestNearDetectionAsync(ct);
+                    }
+                    else if (key == ConsoleKey.C)
+                    {
+                        await ToggleContinuousFarDetectionAsync(ct);
+                    }
+                    else if (key == ConsoleKey.V)
+                    {
+                        await ToggleContinuousNearDetectionAsync(ct);
                     }
                 }
 
@@ -181,6 +201,40 @@ public sealed class ArmTestRunner
         }
         finally
         {
+            if (_continuousFarDetectionCts != null)
+            {
+                _continuousFarDetectionCts.Cancel();
+                if (_continuousFarDetectionTask != null)
+                {
+                    try
+                    {
+                        await _continuousFarDetectionTask;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // expected
+                    }
+                }
+                _continuousFarDetectionCts.Dispose();
+            }
+
+            if (_continuousNearDetectionCts != null)
+            {
+                _continuousNearDetectionCts.Cancel();
+                if (_continuousNearDetectionTask != null)
+                {
+                    try
+                    {
+                        await _continuousNearDetectionTask;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // expected
+                    }
+                }
+                _continuousNearDetectionCts.Dispose();
+            }
+
             Console.WriteLine("断开机械臂连接...");
             await _robot.StopAsync(ct);
             await _robot.DisconnectAsync(ct);
@@ -207,6 +261,8 @@ public sealed class ArmTestRunner
         if (result.SelectedTarget != null)
         {
             Console.WriteLine($"  selected center: {result.SelectedTarget.Center}");
+            Console.WriteLine($"  selected top_center: {result.SelectedTarget.TopCenter}");
+            await PrintBaseCoordinatesAsync(result.SelectedTarget.TopCenter, "top_center", ct);
         }
     }
 
@@ -231,6 +287,112 @@ public sealed class ArmTestRunner
         {
             Console.WriteLine($"  selected center: {result.SelectedTarget.Center}");
             Console.WriteLine($"  keypoints: {result.SelectedTarget.Keypoints.Count}");
+            await PrintBaseCoordinatesAsync(result.SelectedTarget.Center, "center", ct);
+        }
+    }
+
+    private async Task PrintBaseCoordinatesAsync(ImagePoint? point, string label, CancellationToken ct)
+    {
+        if (_transformer == null || point == null)
+        {
+            return;
+        }
+
+        var currentPose = await _robot.GetToolPoseAsync(ct);
+        var basePose = _transformer.ImagePointToBase(point, currentPose);
+        if (basePose != null)
+        {
+            Console.WriteLine($"  {label} in Base: {basePose}");
+        }
+    }
+
+    private Task ToggleContinuousFarDetectionAsync(CancellationToken ct)
+    {
+        if (_perception == null)
+        {
+            Console.WriteLine("[Warning] 未配置视觉感知。");
+            return Task.CompletedTask;
+        }
+
+        if (_continuousFarDetection)
+        {
+            _continuousFarDetection = false;
+            _continuousFarDetectionCts?.Cancel();
+            Console.WriteLine("[C] 停止连续 far bbox 检测。");
+        }
+        else
+        {
+            _continuousFarDetection = true;
+            _continuousFarDetectionCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _continuousFarDetectionTask = RunContinuousFarDetectionAsync(_continuousFarDetectionCts.Token);
+            Console.WriteLine("[C] 开始连续 far bbox 检测，再次按 C 停止。");
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private Task ToggleContinuousNearDetectionAsync(CancellationToken ct)
+    {
+        if (_perception == null)
+        {
+            Console.WriteLine("[Warning] 未配置视觉感知。");
+            return Task.CompletedTask;
+        }
+
+        if (_continuousNearDetection)
+        {
+            _continuousNearDetection = false;
+            _continuousNearDetectionCts?.Cancel();
+            Console.WriteLine("[V] 停止连续 near pose line 检测。");
+        }
+        else
+        {
+            _continuousNearDetection = true;
+            _continuousNearDetectionCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _continuousNearDetectionTask = RunContinuousNearDetectionAsync(_continuousNearDetectionCts.Token);
+            Console.WriteLine("[V] 开始连续 near pose line 检测，再次按 V 停止。");
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private async Task RunContinuousNearDetectionAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await TestNearDetectionAsync(ct);
+                await Task.Delay(200, ct); // 约 5 FPS，避免占用过多 CPU/GPU
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // 正常停止
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[连续 near 检测错误] {ex.Message}");
+        }
+    }
+
+    private async Task RunContinuousFarDetectionAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await TestFarDetectionAsync(ct);
+                await Task.Delay(200, ct); // 约 5 FPS，避免占用过多 CPU/GPU
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // 正常停止
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[连续检测错误] {ex.Message}");
         }
     }
 

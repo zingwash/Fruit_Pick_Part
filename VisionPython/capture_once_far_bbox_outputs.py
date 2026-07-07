@@ -87,6 +87,13 @@ def is_trusted_bbox(confidence: float, center_z: float | None, trust_conf: float
     return bool(confidence >= trust_conf and center_z is not None)
 
 
+def convert_uv_rotated_to_original(
+    u: float, v: float, image_width: int, image_height: int
+) -> tuple[int, int]:
+    """把推理用旋转 180° 后的图像坐标转回原始相机图像坐标。"""
+    return int(round(image_width - 1 - u)), int(round(image_height - 1 - v))
+
+
 def select_grape(grapes: list[dict[str, Any]], selection_rule: str) -> dict[str, Any] | None:
     """目标选择边界：后续成熟度、mask 面积、综合评分等规则只扩展这里。"""
     trusted_grapes = [grape for grape in grapes if bool(grape.get("trusted"))]
@@ -106,6 +113,7 @@ def extract_grape_outputs(
     image_width: int,
     image_height: int,
     trust_conf: float,
+    rotate_180: bool = False,
 ) -> list[dict[str, Any]]:
     if result.boxes is None or len(result.boxes) == 0:
         return []
@@ -124,6 +132,24 @@ def extract_grape_outputs(
         center_x = (x1 + x2) / 2.0
         center_y = (y1 + y2) / 2.0
         confidence = rounded_float(box_confs[i])
+
+        if rotate_180:
+            top_center_x_rot, top_center_y_rot = center_x, y1
+            x1, y1, x2, y2 = (
+                image_width - 1 - x2,
+                image_height - 1 - y2,
+                image_width - 1 - x1,
+                image_height - 1 - y1,
+            )
+            center_x, center_y = convert_uv_rotated_to_original(
+                center_x, center_y, image_width, image_height
+            )
+            top_center_x, top_center_y = convert_uv_rotated_to_original(
+                top_center_x_rot, top_center_y_rot, image_width, image_height
+            )
+        else:
+            top_center_x, top_center_y = int(round(center_x)), int(round(y1))
+
         center_z = get_depth_z(depth_frame, center_x, center_y, image_width, image_height)
         trusted = is_trusted_bbox(confidence, center_z, trust_conf)
 
@@ -133,7 +159,7 @@ def extract_grape_outputs(
             "bbox": {
                 "xyxy": [int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))],
                 "center_uv": [int(round(center_x)), int(round(center_y))],
-                "top_center_uv": [int(round(center_x)), int(round(y1))],
+                "top_center_uv": [top_center_x, top_center_y],
                 "center_z": center_z,
                 "confidence": confidence,
                 "trusted": trusted,

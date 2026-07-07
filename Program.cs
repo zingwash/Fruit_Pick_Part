@@ -1,7 +1,9 @@
 using FruitPickPart.App;
 using FruitPickPart.Configuration;
+using FruitPickPart.Geometry;
 using FruitPickPart.Perception;
 using FruitPickPart.Robotics;
+using Microsoft.Extensions.Configuration;
 
 namespace FruitPickPart;
 
@@ -9,59 +11,28 @@ class Program
 {
     static async Task Main(string[] args)
     {
-        Console.WriteLine("=== FruitPickPart Step 3: 机械臂 + 夹爪 + 视觉测试 ===");
+        Console.WriteLine("=== FruitPickPart Step 4: 像素/深度 → Base 坐标转换 ===");
         Console.WriteLine("按 Q 可退出程序。");
         Console.WriteLine();
 
-        var profile = new RobotProfile
-        {
-            Name = "Rm65Current",
-            DisplayName = "RM65 Current",
-            RealManDevMode = 65,
-            JointDof = 6,
-            Ip = "192.168.1.18",
-            Port = 8080,
-            RecvTimeoutMs = 3000,
-            TcpOffsetZ = 0.22,
-            AllowConnect = true,
-            AllowMotion = true
-        };
-
-        var gripperProfile = new GripperProfile
-        {
-            Enabled = true,
-            Type = GripperType.Pgc30060,
-            ModbusPort = 1,
-            DeviceAddress = 1,
-            BaudRate = 115200,
-            Timeout100msUnits = 10,
-            DefaultSpeed = 100,
-            DefaultForce = 100,
-            OpenPosition = 100,
-            ClosePosition = 0,
-            InitializeOnConnect = true,
-            InitializeDelayMs = 3000,
-            ActionDelayMs = 300
-        };
-
-        var cameraProfile = new CameraProfile
-        {
-            Name = "D435_Current",
-            Serial = "243622071729",
-            Width = 1280,
-            Height = 720,
-            Fps = 30
-        };
-
-        var visionModelProfile = new VisionModelProfile
-        {
-            Name = "YoloV26L_Current",
-            NearModelRelativePath = "VisionPython\\models\\yolov26l_near_point_1280.pt",
-            FarModelRelativePath = "VisionPython\\models\\yolov26l_far_bbox_1280.pt"
-        };
-
         string appRoot = FindAppRoot(AppContext.BaseDirectory);
         Console.WriteLine($"应用根目录：{appRoot}");
+
+        var configuration = new ConfigurationBuilder()
+            .SetBasePath(appRoot)
+            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: false)
+            .Build();
+
+        var profile = configuration.GetSection("RobotProfile").Get<RobotProfile>()
+            ?? throw new InvalidOperationException("找不到 RobotProfile 配置。");
+        var gripperProfile = configuration.GetSection("GripperProfile").Get<GripperProfile>()
+            ?? throw new InvalidOperationException("找不到 GripperProfile 配置。");
+        var cameraProfile = configuration.GetSection("CameraProfile").Get<CameraProfile>()
+            ?? throw new InvalidOperationException("找不到 CameraProfile 配置。");
+        var handEyeProfile = configuration.GetSection("HandEyeProfile").Get<HandEyeProfile>()
+            ?? throw new InvalidOperationException("找不到 HandEyeProfile 配置。");
+        var visionModelProfile = configuration.GetSection("VisionModelProfile").Get<VisionModelProfile>()
+            ?? throw new InvalidOperationException("找不到 VisionModelProfile 配置。");
 
         await using IRobot robot = new Rm65Robot(profile);
 
@@ -72,6 +43,7 @@ class Program
         // 夹爪传输层依赖机械臂底层句柄，必须在机械臂连接后创建
         IGripper? gripper = null;
         IPerception? perception = null;
+        ICoordinateTransformer? transformer = null;
         try
         {
             if (gripperProfile.Enabled)
@@ -85,12 +57,17 @@ class Program
                 gripper = new PgcGripper(transport, gripperProfile);
             }
 
+            // 加载相机内参和手眼标定
+            Console.WriteLine("正在加载视觉标定参数...");
+            transformer = new CameraToRobotTransformer(appRoot, cameraProfile, handEyeProfile);
+            Console.WriteLine("视觉标定参数已加载。");
+
             // 启动 Python 视觉 worker
             Console.WriteLine("正在启动 Python 视觉 worker...");
             perception = new PythonWorkerPerception(appRoot, cameraProfile, visionModelProfile);
             Console.WriteLine("视觉 worker 已启动。");
 
-            var runner = new ArmTestRunner(robot, profile, gripper, perception);
+            var runner = new ArmTestRunner(robot, profile, gripper, perception, transformer);
 
             using var cts = new CancellationTokenSource();
             Console.CancelKeyPress += (sender, e) =>

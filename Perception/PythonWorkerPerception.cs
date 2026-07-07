@@ -49,7 +49,9 @@ public sealed class PythonWorkerPerception : IPerception
                         $"--height {cameraProfile.Height} " +
                         $"--fps {cameraProfile.Fps} " +
                         $"--model \"{nearModelPath}\" " +
-                        $"--far-model \"{farModelPath}\"",
+                        $"--far-model \"{farModelPath}\"" +
+                        (visionModelProfile.ShowDebugView ? " --debug-view" : "") +
+                        (visionModelProfile.RotateImage180 ? " --rotate-180" : ""),
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -189,7 +191,8 @@ public sealed class PythonWorkerPerception : IPerception
             }
         }
 
-        if (result.TryGetProperty("selected_grape_index", out JsonElement indexElement))
+        if (result.TryGetProperty("selected_grape_index", out JsonElement indexElement)
+            && indexElement.ValueKind != JsonValueKind.Null)
         {
             selectedIndex = indexElement.GetInt32();
             if (selectedIndex >= 0 && selectedIndex < targets.Count)
@@ -231,19 +234,42 @@ public sealed class PythonWorkerPerception : IPerception
         {
             center = ParseImagePoint(boxCenterElement);
         }
+        else if (element.TryGetProperty("bbox", out JsonElement bboxElement))
+        {
+            // far bbox 格式：bbox.center_uv + bbox.center_z
+            center = ParseImagePointFromBbox(bboxElement, "center_uv", "center_z");
+        }
 
         ImagePoint? topCenter = null;
         if (element.TryGetProperty("top_center", out JsonElement topCenterElement))
         {
             topCenter = ParseImagePoint(topCenterElement);
         }
+        else if (element.TryGetProperty("bbox", out JsonElement bboxForTopElement))
+        {
+            // far bbox 格式：bbox.top_center_uv + bbox.center_z
+            topCenter = ParseImagePointFromBbox(bboxForTopElement, "top_center_uv", "center_z");
+        }
+
+        double confidence = 0;
+        if (element.TryGetProperty("confidence", out JsonElement confElement)
+            && confElement.ValueKind == JsonValueKind.Number)
+        {
+            confidence = confElement.GetDouble();
+        }
+        else if (element.TryGetProperty("bbox", out JsonElement bboxForConfElement)
+            && bboxForConfElement.TryGetProperty("confidence", out JsonElement bboxConfElement)
+            && bboxConfElement.ValueKind == JsonValueKind.Number)
+        {
+            confidence = bboxConfElement.GetDouble();
+        }
 
         return new DetectedTarget
         {
             Index = element.TryGetProperty("index", out JsonElement indexElement) ? indexElement.GetInt32() : 0,
-            Trusted = element.TryGetProperty("trusted", out JsonElement trustedElement) && trustedElement.GetBoolean(),
+            Trusted = element.TryGetProperty("trusted", out JsonElement trustedElement) && trustedElement.ValueKind == JsonValueKind.True && trustedElement.GetBoolean(),
             ClassName = element.TryGetProperty("class_name", out JsonElement classElement) ? classElement.GetString() ?? "" : "",
-            Confidence = element.TryGetProperty("confidence", out JsonElement confElement) ? confElement.GetDouble() : 0,
+            Confidence = confidence,
             Center = center,
             TopCenter = topCenter,
             Keypoints = keypoints
@@ -256,13 +282,16 @@ public sealed class PythonWorkerPerception : IPerception
         double z = 0, conf = 0;
         bool valid = false;
 
-        if (element.TryGetProperty("uv", out JsonElement uvElement) && uvElement.GetArrayLength() >= 2)
+        if (element.TryGetProperty("uv", out JsonElement uvElement)
+            && uvElement.ValueKind == JsonValueKind.Array
+            && uvElement.GetArrayLength() >= 2)
         {
-            u = uvElement[0].GetInt32();
-            v = uvElement[1].GetInt32();
+            u = uvElement[0].ValueKind == JsonValueKind.Number ? uvElement[0].GetInt32() : 0;
+            v = uvElement[1].ValueKind == JsonValueKind.Number ? uvElement[1].GetInt32() : 0;
         }
 
-        if (element.TryGetProperty("z", out JsonElement zElement))
+        if (element.TryGetProperty("z", out JsonElement zElement)
+            && zElement.ValueKind == JsonValueKind.Number)
         {
             z = zElement.GetDouble();
         }
@@ -275,6 +304,48 @@ public sealed class PythonWorkerPerception : IPerception
         if (element.TryGetProperty("trusted", out JsonElement trustedElement))
         {
             valid = trustedElement.GetBoolean();
+        }
+
+        return new ImagePoint
+        {
+            U = u,
+            V = v,
+            DepthM = z,
+            Confidence = conf,
+            IsValid = valid
+        };
+    }
+
+    private static ImagePoint ParseImagePointFromBbox(JsonElement bboxElement, string uvPropertyName, string zPropertyName)
+    {
+        int u = 0, v = 0;
+        double z = 0, conf = 0;
+        bool valid = false;
+
+        if (bboxElement.TryGetProperty(uvPropertyName, out JsonElement uvElement)
+            && uvElement.ValueKind == JsonValueKind.Array
+            && uvElement.GetArrayLength() >= 2)
+        {
+            u = uvElement[0].ValueKind == JsonValueKind.Number ? uvElement[0].GetInt32() : 0;
+            v = uvElement[1].ValueKind == JsonValueKind.Number ? uvElement[1].GetInt32() : 0;
+        }
+
+        if (bboxElement.TryGetProperty(zPropertyName, out JsonElement zElement)
+            && zElement.ValueKind == JsonValueKind.Number)
+        {
+            z = zElement.GetDouble();
+        }
+
+        if (bboxElement.TryGetProperty("confidence", out JsonElement confElement)
+            && confElement.ValueKind == JsonValueKind.Number)
+        {
+            conf = confElement.GetDouble();
+        }
+
+        if (bboxElement.TryGetProperty("trusted", out JsonElement trustedElement)
+            && trustedElement.ValueKind == JsonValueKind.True)
+        {
+            valid = true;
         }
 
         return new ImagePoint
