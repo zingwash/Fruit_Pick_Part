@@ -20,6 +20,12 @@ public sealed class FarApproachProfile
     /// <summary>单次最大允许靠近距离（米）。</summary>
     public double MaxApproachM { get; set; } = 0.60;
 
+    /// <summary>
+    /// 目标点相对于当前点，沿工具 Z 正方向最大允许前进距离（米）。
+    /// 超过此值时目标点会沿工具 Z 反方向被截断到该距离。
+    /// </summary>
+    public double MaxToolZForwardTravelM { get; set; } = 0.20;
+
     /// <summary>是否让工具 Z 轴正对目标（TopCenter）；默认 false，避免生成极端欧拉角。</summary>
     public bool AlignToolZToTarget { get; set; } = false;
 

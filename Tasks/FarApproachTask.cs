@@ -111,6 +111,14 @@ public sealed class FarApproachTask : IPickTask
             _profile.MaxApproachM,
             _profile.AlignToolZToTarget);
 
+        // 限制工具 Z 正方向最大前进距离
+        targetFlangePose = PoseUtils.ClampTcpAlongToolZ(
+            currentFlangePose,
+            targetFlangePose,
+            _robotProfile.TcpOffsetZ,
+            _profile.MaxToolZForwardTravelM,
+            "FarApproachTask");
+
         Console.WriteLine($"[FarApproachTask] 远距靠近目标法兰位姿：{targetFlangePose}");
 
         // 5. 执行运动

@@ -83,6 +83,14 @@ public sealed class NearPickTask : IPickTask
             _profile.TcpInsertionDepthM,
             alignToolZToTarget: !preserveEndEffectorOrientation);
 
+        // 限制工具 Z 正方向最大前进距离
+        pickFlangePose = PoseUtils.ClampTcpAlongToolZ(
+            currentFlangePose,
+            pickFlangePose,
+            _robotProfile.TcpOffsetZ,
+            _profile.MaxToolZForwardTravelM,
+            "NearPickTask");
+
         Console.WriteLine($"[NearPickTask] 采摘目标法兰位姿：{pickFlangePose}");
 
         // 6. 计算参考点处的法兰位姿：TCP 刚好位于 pickBase（未往前伸入葡萄）

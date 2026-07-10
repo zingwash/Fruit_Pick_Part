@@ -27,6 +27,12 @@ public sealed class NearPickProfile
     public double TcpInsertionDepthM { get; set; } = 0.0;
 
     /// <summary>
+    /// 目标点相对于当前点，沿工具 Z 正方向最大允许前进距离（米）。
+    /// 超过此值时目标点会沿工具 Z 反方向被截断到该距离。
+    /// </summary>
+    public double MaxToolZForwardTravelM { get; set; } = 0.20;
+
+    /// <summary>
     /// 两段式靠近时，TCP 在最终采摘点前预留的安全距离（米）。
     /// 先移动到 core_point 前该距离处，再沿工具 Z 前进完成采摘。
     /// </summary>
