@@ -14,6 +14,12 @@ public sealed class FarApproachProfile
     /// <summary>在目标前预留的安全距离（米）。0 表示 far 靠近直接停在 TopCenterClearanceM 处。</summary>
     public double ApproachReserveM { get; set; } = 0.0;
 
+    /// <summary>
+    /// TCP 与葡萄串中心（far top_center）的最小距离（米）。
+    /// 计算出的目标位姿若使 TCP 离目标点小于此值，会沿远离目标方向回退到该距离。
+    /// </summary>
+    public double MinTcpToTargetDistanceM { get; set; } = 0.05;
+
     /// <summary>TCP 在 TopCenter 前方（靠近方向）的间隙（米）。与 ApproachReserveM 共同决定 far 靠近后 TCP 离葡萄串的距离。</summary>
     public double TopCenterClearanceM { get; set; } = 0.05;
 

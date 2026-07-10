@@ -95,6 +95,7 @@ Fruit_Pick_Part/
 > - 远端/近端/放置任务支持分阶段“先位置后姿态”运动与 IK 预检查（由 `appsettings.json` 配置开关控制）。
 > - **远端靠近分阶段运动**：`FarApproachProfile` 支持 `UseStagedToolXyThenToolZ`（默认 `true`）。启用后，远端靠近先执行工具 X/Y 阶段（保持当前工具 Z 不变），再执行工具 Z 阶段（沿工具 Z 直线移动到目标），避免远距靠近时一开始就斜向插向葡萄串。
 > - **工具 Z 正方向前进距离限制**：`FarApproachProfile` 与 `NearPickProfile` 支持 `MaxToolZForwardTravelM`。当计算出的目标 TCP 相对于当前 TCP 沿工具 Z 正方向前进超过该值时，目标位姿会自动沿工具 Z 反方向截断到该距离，防止机械臂过度前伸。当前配置：远端靠近 `0.08m`，近端采摘 `0.10m`。
+> - **远端靠近最小安全距离**：`FarApproachProfile` 支持 `MinTcpToTargetDistanceM`（默认 `0.05m`）。计算出的目标 TCP 若离 far `top_center` 小于该值，会自动沿远离目标方向回退，保证机械臂末端与葡萄串中心至少保持该距离。
 > - 急停响应优化：手柄 B 键监听轮询缩短到 5ms；运动指令返回非 0 且取消令牌已取消时，正确抛 `OperationCanceledException`。
 > - 夹爪闭合程度可控：`NearPickProfile` 支持 `GripperClosePosition`（0-100，默认 0）与 `GripperCloseForce`（0-100，默认 100），可在 `appsettings.json` 中配置。
 >

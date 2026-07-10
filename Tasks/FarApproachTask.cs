@@ -119,6 +119,13 @@ public sealed class FarApproachTask : IPickTask
             _profile.MaxToolZForwardTravelM,
             "FarApproachTask");
 
+        // 保证 TCP 离葡萄串中心不小于最小安全距离
+        targetFlangePose = EnsureMinTcpToTargetDistance(
+            targetFlangePose,
+            topCenterBase,
+            _robotProfile.TcpOffsetZ,
+            _profile.MinTcpToTargetDistanceM);
+
         Console.WriteLine($"[FarApproachTask] 远距靠近目标法兰位姿：{targetFlangePose}");
 
         // 5. 执行运动
@@ -240,6 +247,70 @@ public sealed class FarApproachTask : IPickTask
         return farResult != null
             && farResult.Trusted
             && farResult.SelectedTarget != null;
+    }
+
+    /// <summary>
+    /// 确保目标法兰位姿对应的 TCP 离目标点（葡萄串中心）不小于最小安全距离。
+    /// 若小于，则沿 TCP 指向目标点的方向回退到该距离（姿态保持不变）。
+    /// </summary>
+    private static Pose3D EnsureMinTcpToTargetDistance(
+        Pose3D targetFlangePose,
+        Pose3D targetPointBase,
+        double tcpOffsetZ,
+        double minDistanceM)
+    {
+        if (minDistanceM <= 0)
+        {
+            return targetFlangePose;
+        }
+
+        var tBaseFlange = Transform3D.FromEulerZyx(
+            targetFlangePose.X, targetFlangePose.Y, targetFlangePose.Z,
+            targetFlangePose.Rx, targetFlangePose.Ry, targetFlangePose.Rz);
+
+        double[] toolZ = [tBaseFlange[0, 2], tBaseFlange[1, 2], tBaseFlange[2, 2]];
+        double[] tcpPos =
+        [
+            targetFlangePose.X + toolZ[0] * tcpOffsetZ,
+            targetFlangePose.Y + toolZ[1] * tcpOffsetZ,
+            targetFlangePose.Z + toolZ[2] * tcpOffsetZ
+        ];
+
+        double dx = targetPointBase.X - tcpPos[0];
+        double dy = targetPointBase.Y - tcpPos[1];
+        double dz = targetPointBase.Z - tcpPos[2];
+        double distance = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+
+        if (distance >= minDistanceM)
+        {
+            return targetFlangePose;
+        }
+
+        double shortage = minDistanceM - distance;
+        double[] dirToTarget = Normalize([dx, dy, dz]);
+
+        double[] newTcpPos =
+        [
+            tcpPos[0] - dirToTarget[0] * shortage,
+            tcpPos[1] - dirToTarget[1] * shortage,
+            tcpPos[2] - dirToTarget[2] * shortage
+        ];
+
+        double[] newFlangePos =
+        [
+            newTcpPos[0] - toolZ[0] * tcpOffsetZ,
+            newTcpPos[1] - toolZ[1] * tcpOffsetZ,
+            newTcpPos[2] - toolZ[2] * tcpOffsetZ
+        ];
+
+        Console.WriteLine($"[FarApproachTask] TCP 离目标点 {distance:F3}m，小于最小距离 {minDistanceM:F3}m，已回退到 {minDistanceM:F3}m。");
+
+        return targetFlangePose with
+        {
+            X = newFlangePos[0],
+            Y = newFlangePos[1],
+            Z = newFlangePos[2]
+        };
     }
 
     /// <summary>
