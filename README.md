@@ -85,12 +85,16 @@ Fruit_Pick_Part/
 >
 > 当前支持：
 > - 固定点位采摘循环（`FixedWaypointTask`，按 `P` 键）。
-> - 远距靠近（按 `A` 键）：通过 far bbox 粗定位并靠近目标；自动识别成功或手动标定成功的结果均会保存，供近端采摘回退使用。
-> - 近端采摘（按 `S` 键）：通过 near pose line 精定位；识别失败或用户按其他键时，使用 far bbox 的 `top_center` 作为回退采摘点。
+> - 远距靠近（按 `A` 键）：通过 far bbox 粗定位并靠近目标；**自动识别失败时自动进入手动标定模式**，标定成功的结果会保存，供近端采摘回退使用。
+> - 近端采摘（按 `S` 键）：通过 near pose line 精定位；识别失败时优先做一次新的自动 far 识别，失败则使用 `context` 中保存的远端 far `top_center` 作为回退采摘点。
+> - 近端采摘 far 校验（在完整循环中生效）：若 near 识别成功，会用远端靠近阶段保存的 far `top_center` 做偏差校验；若 near 采摘点与 far `top_center` 距离 **> 0.5cm**，判定 near 失效，优先使用新的自动 far 识别，失败则回退远端 far `top_center`。
+> - 近端采摘阶段新的自动 far 识别失败后，**直接回退远端 far `top_center`，不再进入手动标定**（手动标定仅在远端靠近阶段使用）。
 > - 放置到框（按 `D` 键）：将采摘到的葡萄放入固定框中，沿 Base Z 方向撤离后回到 Home。`PlaceProfile` 中的 `BoxApproachPose` 与 `BoxPlacePose` 已根据实际框位姿标定。
-> - 完整采摘循环（按 `Space` 键或手柄 `A`）：Home → 远距靠近 → 近端采摘 → 放置到框。
+> - 完整采摘循环（按 `Space` 键或手柄 `A`）：Home → 远距靠近 → 近端采摘 → 放置到框；远距靠近与近端采摘之间通过 `PickTaskContext.FarResult` 传递 far 检测结果。
 > - 近端采摘运动路径优化：先工具 XY、再工具 Z 靠近，工具 Z 阶段、采摘阶段、撤离阶段均使用直线运动；直线运动前进行轨迹采样可达性检查，姿态全程保持不变。
 > - 远端/近端/放置任务支持分阶段“先位置后姿态”运动与 IK 预检查（由 `appsettings.json` 配置开关控制）。
+> - 急停响应优化：手柄 B 键监听轮询缩短到 5ms；运动指令返回非 0 且取消令牌已取消时，正确抛 `OperationCanceledException`。
+> - 夹爪闭合程度可控：`NearPickProfile` 支持 `GripperClosePosition`（0-100，默认 0）与 `GripperCloseForce`（0-100，默认 100），可在 `appsettings.json` 中配置。
 >
 > 后续重点：在真实场景下连续运行 far → near → place → home 完整流程，验证稳定性与重复精度。
 
