@@ -32,6 +32,12 @@ public sealed class FarApproachProfile
     /// <summary>是否使用直线运动（Movel），否则使用关节空间到目标位姿（Movej_P）。</summary>
     public bool UseLinearMove { get; set; } = false;
 
+    /// <summary>
+    /// 是否启用“先工具 XY、再工具 Z”分阶段运动。
+    /// 先保持当前工具 Z 不变，只移动工具 X/Y；再沿工具 Z 移动到目标。
+    /// </summary>
+    public bool UseStagedToolXyThenToolZ { get; set; } = true;
+
     /// <summary>是否启用“先位置、后姿态”分阶段运动，降低目标不可达概率。</summary>
     public bool UseStagedPositionThenEuler { get; set; } = true;
 

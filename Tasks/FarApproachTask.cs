@@ -129,7 +129,7 @@ public sealed class FarApproachTask : IPickTask
             BlockUntilComplete = true
         };
 
-        await MoveToolWithProfileAsync(robot, targetFlangePose, moveOptions, ct);
+        await MoveToolWithProfileAsync(robot, currentFlangePose, targetFlangePose, moveOptions, ct);
         ct.ThrowIfCancellationRequested();
         Console.WriteLine("[FarApproachTask] 远距靠近完成。");
     }
@@ -138,9 +138,32 @@ public sealed class FarApproachTask : IPickTask
     /// 根据配置选择直接运动或分阶段安全运动。
     /// 若启用 IK 预检查且目标不可达，会尝试小幅度扰动姿态寻找可达解。
     /// </summary>
-    private async Task MoveToolWithProfileAsync(IRobot robot, Pose3D target, MoveOptions baseOptions, CancellationToken ct)
+    private async Task MoveToolWithProfileAsync(
+        IRobot robot,
+        Pose3D currentFlangePose,
+        Pose3D target,
+        MoveOptions baseOptions,
+        CancellationToken ct)
     {
         Console.WriteLine($"[FarApproachTask] 准备运动到目标：{target}");
+
+        if (_profile.UseStagedToolXyThenToolZ)
+        {
+            Console.WriteLine("[FarApproachTask] 使用工具 XY → 工具 Z 分阶段运动。");
+
+            // 阶段 1：工具 X/Y 阶段（保持当前工具 Z 不变）
+            var xyOnlyPose = PoseUtils.ComputeToolXyOnlyPose(currentFlangePose, target);
+            Console.WriteLine($"[FarApproachTask] 工具 XY 阶段：{xyOnlyPose}");
+            await robot.MoveToolAsync(xyOnlyPose, baseOptions, ct);
+            ct.ThrowIfCancellationRequested();
+
+            // 阶段 2：工具 Z 阶段（沿工具 Z 直线移动到目标）
+            Console.WriteLine($"[FarApproachTask] 工具 Z 阶段：{target}");
+            var toolZOptions = baseOptions with { MoveMode = MoveMode.Linear };
+            await robot.MoveToolAsync(target, toolZOptions, ct);
+            ct.ThrowIfCancellationRequested();
+            return;
+        }
 
         if (robot is not IStagedMotionRobot staged || !_profile.UseStagedPositionThenEuler)
         {

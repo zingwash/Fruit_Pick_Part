@@ -8,6 +8,44 @@ namespace FruitPickPart.Geometry;
 public static class PoseUtils
 {
     /// <summary>
+    /// 计算工具 X/Y -only 中间位姿。
+    /// 保持当前姿态，将目标位姿相对当前位姿的偏移投影到工具 X/Y 平面上，
+    /// 得到仅改变工具 X、Y 坐标、工具 Z 与当前相同的中间位姿。
+    /// </summary>
+    public static Pose3D ComputeToolXyOnlyPose(Pose3D currentFlangePose, Pose3D targetFlangePose)
+    {
+        var tBaseFlange = Transform3D.FromEulerZyx(
+            currentFlangePose.X,
+            currentFlangePose.Y,
+            currentFlangePose.Z,
+            currentFlangePose.Rx,
+            currentFlangePose.Ry,
+            currentFlangePose.Rz);
+
+        // 工具坐标系 X/Y 轴在 Base 坐标系中的表示（变换矩阵 R 的列）
+        double[] toolX = [tBaseFlange[0, 0], tBaseFlange[1, 0], tBaseFlange[2, 0]];
+        double[] toolY = [tBaseFlange[0, 1], tBaseFlange[1, 1], tBaseFlange[2, 1]];
+
+        // 当前法兰指向目标法兰的向量
+        double dx = targetFlangePose.X - currentFlangePose.X;
+        double dy = targetFlangePose.Y - currentFlangePose.Y;
+        double dz = targetFlangePose.Z - currentFlangePose.Z;
+
+        // 将该向量投影到工具 X/Y 平面
+        double tx = toolX[0] * dx + toolX[1] * dy + toolX[2] * dz;
+        double ty = toolY[0] * dx + toolY[1] * dy + toolY[2] * dz;
+
+        // 中间位姿 = 当前位置 + 工具 X/Y 方向偏移，姿态保持不变
+        return new Pose3D(
+            currentFlangePose.X + toolX[0] * tx + toolY[0] * ty,
+            currentFlangePose.Y + toolX[1] * tx + toolY[1] * ty,
+            currentFlangePose.Z + toolX[2] * tx + toolY[2] * ty,
+            currentFlangePose.Rx,
+            currentFlangePose.Ry,
+            currentFlangePose.Rz);
+    }
+
+    /// <summary>
     /// 限制目标法兰位姿，使得目标 TCP 相对于当前 TCP 沿工具 Z 正方向的前进距离不超过 maxForwardTravelM。
     /// 如果目标前进距离超过限制，则沿工具 Z 反方向截断目标位置（姿态保持不变）。
     /// </summary>
