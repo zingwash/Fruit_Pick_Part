@@ -38,7 +38,9 @@ from capture_once_near_pose_line_outputs import (
 from capture_once_far_bbox_outputs import (
     build_output as build_far_output,
     extract_grape_outputs as extract_far_grape_outputs,
+    get_depth_z,
     has_trusted_grape as has_trusted_far_grape,
+    is_trusted_bbox,
 )
 
 
@@ -61,6 +63,11 @@ DEFAULT_IMGSZ = 640
 NEAR_FAILURE_TRACE_DIR = ROOT / "outputs" / "near_pose_line_failures"
 FAR_SAFE_CENTER_U_MIN = 200
 FAR_SAFE_CENTER_U_MAX = 1080
+MANUAL_FAR_TIMEOUT_SECONDS = 30.0
+MANUAL_FAR_MIN_BOX_PIXELS = 20
+MANUAL_AUTO_CONFIRM_DELAY_SECONDS = 1.0  # 手动标定完成后自动确认前的等待时间，期间可按 R 重画
+DEBUG_LEFT_PANE_WIDTH = 960
+DEBUG_PANE_HEIGHT = 540
 
 
 def log(message: str) -> None:
@@ -228,6 +235,13 @@ class VisionWorker:
         self.latest_output: dict[str, Any] | None = None
         self.latest_inference_frame: np.ndarray | None = None
         self.latest_mode = "IDLE"
+        self.manual_state: dict[str, Any] = {
+            "drawing": False,
+            "start": None,
+            "end": None,
+            "confirmed": False,
+            "cancelled": False,
+        }
         if args.rotate_180:
             log("rotate-180 enabled: inference frame will be rotated 180°, output coords are in original camera frame")
         if self.cv2 is not None:
@@ -348,7 +362,7 @@ class VisionWorker:
 
         return view
 
-    def update_debug_view(self, frame: np.ndarray, depth_frame: Any) -> None:
+    def update_debug_view(self, frame: np.ndarray, depth_frame: Any, manual_active: bool = False) -> None:
         if self.cv2 is None:
             return
 
@@ -360,14 +374,193 @@ class VisionWorker:
         else:
             rotated_view = np.rot90(original_view, 2).copy()
 
-        # 双栏并排显示，单张缩放为 960x540，总窗口 1920x540
+        # 双栏并排显示：左为彩色原图，右为旋转后的推理帧
+        # 单张缩放为 960x540，总窗口 1920x540
         display_w, display_h = 960, 540
         original_small = self.cv2.resize(original_view, (display_w, display_h))
         rotated_small = self.cv2.resize(rotated_view, (display_w, display_h))
         combined = np.hstack((original_small, rotated_small))
 
+        if manual_active:
+            self.cv2.putText(combined, "MANUAL: L pane | Enter=confirm | R/Back=reset | Esc/Q/O=exit", (20, 30), self.cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+
         self.cv2.imshow(DEBUG_WINDOW_NAME, combined)
         self.cv2.waitKey(1)
+
+    # ------------------------------------------------------------------
+    # 远端 far bbox 手动标定（鼠标画框）
+    # ------------------------------------------------------------------
+
+    def _on_manual_mouse(self, event: int, x: int, y: int, flags: int, param: Any) -> None:
+        """鼠标回调：只在左侧原图画布内画框。"""
+        if self.cv2 is None:
+            return
+        if event == self.cv2.EVENT_LBUTTONDOWN:
+            if 0 <= x < DEBUG_LEFT_PANE_WIDTH and 0 <= y < DEBUG_PANE_HEIGHT:
+                self.manual_state["drawing"] = True
+                self.manual_state["start"] = (x, y)
+                self.manual_state["end"] = (x, y)
+        elif event == self.cv2.EVENT_MOUSEMOVE and self.manual_state.get("drawing"):
+            if 0 <= x < DEBUG_LEFT_PANE_WIDTH and 0 <= y < DEBUG_PANE_HEIGHT:
+                self.manual_state["end"] = (x, y)
+        elif event == self.cv2.EVENT_LBUTTONUP:
+            self.manual_state["drawing"] = False
+            self.manual_state["completed"] = True
+            self.manual_state["completed_at"] = time.monotonic()
+
+    def _window_to_camera_uv(self, x_win: int, y_win: int, image_w: int, image_h: int) -> tuple[float, float]:
+        """把调试窗口左侧原图面板的坐标转回原始相机坐标。"""
+        scale_x = DEBUG_LEFT_PANE_WIDTH / image_w
+        scale_y = DEBUG_PANE_HEIGHT / image_h
+        u = float(x_win) / scale_x
+        v = float(y_win) / scale_y
+        u = max(0.0, min(float(image_w - 1), u))
+        v = max(0.0, min(float(image_h - 1), v))
+        return u, v
+
+    def _build_manual_grape(self, frame: np.ndarray, depth_frame: Any, start_win: tuple[int, int], end_win: tuple[int, int], trust_conf: float) -> dict[str, Any] | None:
+        """根据窗口画出的矩形生成一个 far 葡萄对象。"""
+        image_h, image_w = frame.shape[:2]
+        u1, v1 = self._window_to_camera_uv(start_win[0], start_win[1], image_w, image_h)
+        u2, v2 = self._window_to_camera_uv(end_win[0], end_win[1], image_w, image_h)
+        x1, x2 = sorted((u1, u2))
+        y1, y2 = sorted((v1, v2))
+
+        if abs(x2 - x1) < MANUAL_FAR_MIN_BOX_PIXELS or abs(y2 - y1) < MANUAL_FAR_MIN_BOX_PIXELS:
+            return None
+
+        x1i, y1i, x2i, y2i = int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))
+        cx = int(round((x1 + x2) / 2.0))
+        cy = int(round((y1 + y2) / 2.0))
+
+        # 相机倒置时，原始图像的“下方”对应物理空间的“上方”（果梗所在侧）。
+        # 因此 top_center 应取矩形在原始图像中靠近果梗的那条边。
+        if self.args.rotate_180:
+            top_v = max(y1i, y2i)
+        else:
+            top_v = min(y1i, y2i)
+        top_cx, top_cy = cx, top_v
+
+        # 优先取 top_center 处的深度；若无效，依次尝试中心点深度、框内有效深度中位数。
+        depth_array = np.asanyarray(depth_frame.get_data())
+        top_z = get_depth_z(depth_frame, top_cx, top_cy, image_w, image_h)
+        if top_z is None:
+            # 取 top_center 周围 7x7 窗口的中位数
+            radius = 3
+            tx_min, tx_max = max(0, top_cx - radius), min(image_w, top_cx + radius + 1)
+            ty_min, ty_max = max(0, top_cy - radius), min(image_h, top_cy + radius + 1)
+            top_roi = depth_array[ty_min:ty_max, tx_min:tx_max]
+            top_valid = top_roi[top_roi > 0]
+            if top_valid.size > 0:
+                top_z = rounded_float(float(np.median(top_valid)) / 1000.0)
+        if top_z is None:
+            top_z = get_depth_z(depth_frame, cx, cy, image_w, image_h)
+        if top_z is None:
+            roi = depth_array[y1i:y2i + 1, x1i:x2i + 1]
+            valid = roi[roi > 0]
+            if valid.size > 0:
+                top_z = rounded_float(float(np.median(valid)) / 1000.0)
+
+        center_z = top_z
+
+        confidence = 1.0
+        trusted = is_trusted_bbox(confidence, center_z, trust_conf)
+
+        return {
+            "index": 0,
+            "trusted": trusted,
+            "bbox": {
+                "xyxy": [x1i, y1i, x2i, y2i],
+                "center_uv": [cx, cy],
+                "top_center_uv": [top_cx, top_cy],
+                "center_z": center_z,
+                "confidence": confidence,
+                "trusted": trusted,
+            },
+        }
+
+    def _update_manual_preview(self, frame: np.ndarray, depth_frame: Any, trust_conf: float) -> None:
+        """把当前手动框实时更新到 latest_*，让 update_debug_view 画出预览。"""
+        start = self.manual_state.get("start")
+        end = self.manual_state.get("end")
+        if start is None or end is None or self.cv2 is None:
+            return
+        grape = self._build_manual_grape(frame, depth_frame, start, end, trust_conf)
+        if grape is None:
+            return
+        elapsed = 0.0
+        self.latest_grapes = [grape]
+        self.latest_output = build_far_output(frame, self.latest_grapes, elapsed, "manual_annotation", trust_conf)
+        self.latest_inference_frame = np.rot90(frame, 2).copy() if self.args.rotate_180 else frame
+        self.latest_mode = "FAR"
+
+    def run_manual_far_annotation(self, frame: np.ndarray, depth_frame: Any, selection_rule: str, trust_conf: float) -> dict[str, Any] | None:
+        """在调试窗口中等待用户手动画框并确认；取消或超时返回 None。"""
+        if self.cv2 is None:
+            return None
+
+        # 重置状态
+        self.manual_state = {"drawing": False, "start": None, "end": None, "confirmed": False, "cancelled": False}
+        self.cv2.setMouseCallback(DEBUG_WINDOW_NAME, self._on_manual_mouse)
+        log("entering manual far bbox annotation mode")
+
+        start_time = time.monotonic()
+        deadline = start_time + MANUAL_FAR_TIMEOUT_SECONDS
+        result: dict[str, Any] | None = None
+
+        try:
+            while time.monotonic() < deadline:
+                fresh_frame, fresh_depth = self.read_aligned_frame(self.args.frame_timeout_ms)
+                self._update_manual_preview(fresh_frame, fresh_depth, trust_conf)
+                self.update_debug_view(fresh_frame, fresh_depth, manual_active=True)
+
+                key = self.cv2.waitKey(10) & 0xFF
+
+                # 取消
+                if key in (27, ord("q"), ord("Q"), ord("o"), ord("O")):  # Esc / Q / O
+                    log("manual far bbox cancelled")
+                    break
+
+                # 手动标定完成（鼠标已松开）：R 重画，其他任意键或超时自动确认
+                if self.manual_state.get("completed"):
+                    completed_at = self.manual_state.get("completed_at", 0.0)
+                    if key in (ord("r"), ord("R"), 8, 127):  # R / Backspace / Delete
+                        self.manual_state["drawing"] = False
+                        self.manual_state["start"] = None
+                        self.manual_state["end"] = None
+                        self.manual_state["completed"] = False
+                        self.manual_state["completed_at"] = 0.0
+                        self.latest_grapes = []
+                        self.latest_output = None
+                        log("manual far bbox reset, please redraw")
+                        continue
+
+                    if key != 255 or time.monotonic() - completed_at >= MANUAL_AUTO_CONFIRM_DELAY_SECONDS:
+                        start = self.manual_state.get("start")
+                        end = self.manual_state.get("end")
+                        if start is not None and end is not None:
+                            grape = self._build_manual_grape(fresh_frame, fresh_depth, start, end, trust_conf)
+                            if grape is not None and grape["bbox"]["center_z"] is not None:
+                                elapsed = time.monotonic() - start_time
+                                result = build_far_output(fresh_frame, [grape], elapsed, selection_rule, trust_conf)
+                                self.latest_grapes = [grape]
+                                self.latest_output = result
+                                self.latest_inference_frame = np.rot90(fresh_frame, 2).copy() if self.args.rotate_180 else fresh_frame
+                                self.latest_mode = "FAR"
+                                log("manual far bbox confirmed")
+                                break
+                            else:
+                                log("manual box too small or depth invalid, redraw or press R")
+                                # 自动确认时遇到无效框，允许用户重画
+                                self.manual_state["completed"] = False
+                                self.manual_state["completed_at"] = 0.0
+
+        finally:
+            # 取消鼠标回调，避免影响后续普通调试窗口刷新
+            self.cv2.setMouseCallback(DEBUG_WINDOW_NAME, lambda *args, **kwargs: None)
+            self.manual_state = {"drawing": False, "start": None, "end": None, "point": None, "confirmed": False, "cancelled": False, "completed": False, "completed_at": 0.0}
+
+        return result
 
     def capture_near_pose_line(self, request: dict[str, Any]) -> tuple[dict[str, Any], int]:
         timeout_ms = int(request.get("timeout_ms", DEFAULT_CAPTURE_TIMEOUT_MS))
@@ -426,6 +619,7 @@ class VisionWorker:
                 "grapes": [],
             }
             append_near_failure_trace(trace_path, request.get("id"), frames_processed, last_output)
+
         return last_output, frames_processed
 
     def capture_far_bbox(self, request: dict[str, Any]) -> tuple[dict[str, Any], int]:
@@ -435,6 +629,24 @@ class VisionWorker:
         start_time = time.monotonic()
         last_output: dict[str, Any] | None = None
         frames_processed = 0
+
+        # 强制手动模式：跳过自动检测，直接进入手动画框标定
+        if request.get("force_manual"):
+            if self.cv2 is None or not self.args.debug_view:
+                log("force_manual requested but debug view is not available")
+            else:
+                try:
+                    frame, depth_frame = self.read_aligned_frame(self.args.frame_timeout_ms)
+                    manual_output = self.run_manual_far_annotation(
+                        frame,
+                        depth_frame,
+                        str(request.get("selection_rule", "nearest_center_z")),
+                        float(request.get("trust_conf", self.args.far_trust_conf)),
+                    )
+                    if manual_output is not None:
+                        return manual_output, 0
+                except Exception as exc:  # noqa: BLE001
+                    log(f"forced manual far annotation failed: {exc}")
 
         while frames_processed < max(1, max_frames) and time.monotonic() < deadline:
             frame, depth_frame = self.read_aligned_frame(self.args.frame_timeout_ms)
@@ -479,6 +691,22 @@ class VisionWorker:
                 "grape_count": 0,
                 "grapes": [],
             }
+
+        # 自动检测失败且启用了调试窗口时，进入手动画框标定
+        allow_manual_fallback = request.get("allow_manual_fallback", True)
+        if not has_trusted_far_grape(last_output) and allow_manual_fallback and self.cv2 is not None and self.args.debug_view:
+            try:
+                manual_output = self.run_manual_far_annotation(
+                    frame,
+                    depth_frame,
+                    str(request.get("selection_rule", "nearest_center_z")),
+                    float(request.get("trust_conf", self.args.far_trust_conf)),
+                )
+                if manual_output is not None:
+                    return manual_output, frames_processed
+            except Exception as exc:  # noqa: BLE001
+                log(f"manual far annotation failed: {exc}")
+
         return last_output, frames_processed
 
     def poll_camera_for_debug_view(self) -> None:

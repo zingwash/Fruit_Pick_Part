@@ -27,7 +27,7 @@ public sealed class RobotProfile
     public int RecvTimeoutMs { get; set; } = 3000;
 
     /// <summary>工具 TCP 在法兰坐标系下的 Z 偏移（米）。</summary>
-    public double TcpOffsetZ { get; set; } = 0.22;
+    public double TcpOffsetZ { get; set; } = 0.25;
 
     /// <summary>是否允许连接。</summary>
     public bool AllowConnect { get; set; } = true;

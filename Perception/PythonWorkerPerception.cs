@@ -49,7 +49,10 @@ public sealed class PythonWorkerPerception : IPerception
                         $"--height {cameraProfile.Height} " +
                         $"--fps {cameraProfile.Fps} " +
                         $"--model \"{nearModelPath}\" " +
-                        $"--far-model \"{farModelPath}\"" +
+                        $"--far-model \"{farModelPath}\" " +
+                        $"--near-trust-conf {visionModelProfile.NearTrustConfidence:F3} " +
+                        $"--far-trust-conf {visionModelProfile.FarTrustConfidence:F3} " +
+                        $"--core-point-ratio-k0-to-k2 {visionModelProfile.NearCorePointRatioK0ToK2:F2}" +
                         (visionModelProfile.ShowDebugView ? " --debug-view" : "") +
                         (visionModelProfile.RotateImage180 ? " --rotate-180" : ""),
             RedirectStandardInput = true,
@@ -78,11 +81,14 @@ public sealed class PythonWorkerPerception : IPerception
         Console.WriteLine($"Python worker 启动：{pingResponse}");
     }
 
-    public async Task<NearDetectionResult?> CaptureNearAsync(CancellationToken cancellationToken = default)
+    public async Task<NearDetectionResult?> CaptureNearAsync(
+        bool forceManual = false,
+        bool allowManualFallback = true,
+        CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        JsonElement? result = await SendCommandAsync("capture_near_pose_line", cancellationToken);
+        JsonElement? result = await SendCommandAsync("capture_near_pose_line", forceManual, allowManualFallback, cancellationToken);
         if (result == null)
         {
             return null;
@@ -91,11 +97,14 @@ public sealed class PythonWorkerPerception : IPerception
         return ParseNearResult(result.Value);
     }
 
-    public async Task<FarDetectionResult?> CaptureFarAsync(CancellationToken cancellationToken = default)
+    public async Task<FarDetectionResult?> CaptureFarAsync(
+        bool forceManual = false,
+        bool allowManualFallback = true,
+        CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        JsonElement? result = await SendCommandAsync("capture_far_bbox", cancellationToken);
+        JsonElement? result = await SendCommandAsync("capture_far_bbox", forceManual, allowManualFallback, cancellationToken);
         if (result == null)
         {
             return null;
@@ -104,13 +113,17 @@ public sealed class PythonWorkerPerception : IPerception
         return ParseFarResult(result.Value);
     }
 
-    private async Task<JsonElement?> SendCommandAsync(string command, CancellationToken cancellationToken = default)
+    private async Task<JsonElement?> SendCommandAsync(
+        string command,
+        bool forceManual = false,
+        bool allowManualFallback = true,
+        CancellationToken cancellationToken = default)
     {
         await _semaphore.WaitAsync(cancellationToken);
         try
         {
             int id = Interlocked.Increment(ref _requestId);
-            var request = new { id, command };
+            var request = new { id, command, force_manual = forceManual, allow_manual_fallback = allowManualFallback };
             string json = JsonSerializer.Serialize(request);
 
             Console.WriteLine($"[C# -> Python] {json}");

@@ -32,6 +32,12 @@ public readonly record struct MoveOptions
     /// </summary>
     public MoveMode MoveMode { get; init; } = MoveMode.Pose;
 
+    /// <summary>
+    /// 当 MoveMode 为 Linear 且 Movel 失败时，是否允许自动回退到关节空间运动（Movej_P）。
+    /// 默认 true，可在奇异点或工作空间边界附近提高成功率。
+    /// </summary>
+    public bool AllowLinearToPoseFallback { get; init; } = true;
+
     public MoveOptions()
     {
     }

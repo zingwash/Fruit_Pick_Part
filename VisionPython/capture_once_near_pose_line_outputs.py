@@ -256,6 +256,21 @@ def extract_grape_outputs(
             trust_conf,
         )
 
+        # bbox 上边中点：近端姿态识别失败时作为回退采摘点
+        top_center_x = float((x1 + x2) / 2.0)
+        top_center_y = float(y1)
+        if rotate_180:
+            top_center_x, top_center_y = convert_uv_rotated_to_original(
+                top_center_x, top_center_y, image_width, image_height
+            )
+        top_center = make_point(
+            top_center_x,
+            top_center_y,
+            get_depth_z(depth_frame, top_center_x, top_center_y, image_width, image_height, float(box_confs[i]), trust_conf),
+            float(box_confs[i]),
+            trust_conf,
+        )
+
         keypoints: list[dict[str, Any]] = []
         for keypoint_index in range(KEYPOINT_COUNT):
             kp_u = kp_v = None
@@ -293,6 +308,7 @@ def extract_grape_outputs(
             "class_name": class_name,
             "trusted": bool(grape_trusted),
             "box_center": box_center,
+            "top_center": top_center,
         }
         for keypoint_index, point in enumerate(keypoints):
             grape[f"keypoint_{keypoint_index}"] = point

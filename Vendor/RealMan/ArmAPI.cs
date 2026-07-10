@@ -796,7 +796,7 @@ namespace ArmTest
         public static extern Pose Algo_Forward_Kinematics([In, Out] float[] joint);
 
         [DllImport("RM_Base.dll", EntryPoint = "Algo_Inverse_Kinematics", CharSet = CharSet.Auto, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int Algo_Inverse_Kinematics([In, Out] float[] q_in, ref Pose q_pose, [In, Out] float[] q_out, uint flag);
+        public static extern int Algo_Inverse_Kinematics([In, Out] float[] q_in, ref Pose q_pose, [In, Out] float[] q_out, byte flag);
 
         [DllImport("RM_Base.dll", EntryPoint = "Algo_Set_WorkFrame", CharSet = CharSet.Auto, CallingConvention = CallingConvention.Cdecl)]
         public static extern void Algo_Set_WorkFrame(FRAME coord_work);

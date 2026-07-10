@@ -25,7 +25,8 @@ public sealed class FixedWaypointTask : IPickTask
         IGripper? gripper,
         IPerception? perception,
         ICoordinateTransformer? transformer,
-        CancellationToken ct)
+        CancellationToken ct,
+        PickTaskContext? context = null)
     {
         if (_profile.Steps.Count == 0)
         {
@@ -49,6 +50,7 @@ public sealed class FixedWaypointTask : IPickTask
                     Speed = (byte)step.Speed,
                     BlockUntilComplete = true
                 }, ct);
+                ct.ThrowIfCancellationRequested();
 
                 await ExecuteGripperActionAsync(gripper, step.GripperAction, step.GripperDelayMs, ct);
             }

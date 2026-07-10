@@ -42,7 +42,7 @@ public sealed class CameraToRobotTransformer : ICoordinateTransformer
         Console.WriteLine($"[CameraToRobotTransformer] loaded hand-eye method={handEyeProfile.CalibrationMethod}, eye_in_hand={_eyeInHand}");
     }
 
-    public Pose3D? ImagePointToBase(ImagePoint imagePoint, Pose3D currentEndEffectorPose)
+    public Pose3D? ImagePointToBase(ImagePoint imagePoint, Pose3D currentEndEffectorPose, double cameraFrameYOffsetM = 0.0)
     {
         if (imagePoint == null)
         {
@@ -56,10 +56,10 @@ public sealed class CameraToRobotTransformer : ICoordinateTransformer
             return null;
         }
 
-        // 1. 像素反投影到相机坐标系（Z 轴向前）
+        // 1. 像素反投影到相机坐标系（Z 轴向前，Y 轴向下）
         double z = imagePoint.DepthM;
         double x = (imagePoint.U - _cx) * z / _fx;
-        double y = (imagePoint.V - _cy) * z / _fy;
+        double y = (imagePoint.V - _cy) * z / _fy + cameraFrameYOffsetM;
 
         // 2. 相机坐标系 → Base 坐标系
         Transform3D tBaseCamera;

@@ -132,6 +132,22 @@ public sealed class Transform3D
         return new Transform3D(inv);
     }
 
+    /// <summary>
+    /// 从旋转矩阵提取 RealMan RX-RY-RZ 欧拉角（R = Rz * Ry * Rx）。
+    /// </summary>
+    public static (double Rx, double Ry, double Rz) RotationMatrixToEulerZyx(double[,] r)
+    {
+        if (r.GetLength(0) != 3 || r.GetLength(1) != 3)
+        {
+            throw new ArgumentException("必须是 3x3 旋转矩阵", nameof(r));
+        }
+
+        double rx = Math.Atan2(r[2, 1], r[2, 2]);
+        double ry = Math.Atan2(-r[2, 0], Math.Sqrt(r[0, 0] * r[0, 0] + r[1, 0] * r[1, 0]));
+        double rz = Math.Atan2(r[1, 0], r[0, 0]);
+        return (rx, ry, rz);
+    }
+
     public override string ToString()
     {
         return $"T[({TranslationX:F4}, {TranslationY:F4}, {TranslationZ:F4}), R[{_matrix[0, 0]:F4},{_matrix[0, 1]:F4},{_matrix[0, 2]:F4}; ...]]";

@@ -36,6 +36,12 @@ class Program
             ?? throw new InvalidOperationException("找不到 VisionModelProfile 配置。");
         var taskProfile = configuration.GetSection("TaskProfile").Get<TaskProfile>()
             ?? throw new InvalidOperationException("找不到 TaskProfile 配置。");
+        var farApproachProfile = configuration.GetSection("FarApproachProfile").Get<FarApproachProfile>()
+            ?? throw new InvalidOperationException("找不到 FarApproachProfile 配置。");
+        var nearPickProfile = configuration.GetSection("NearPickProfile").Get<NearPickProfile>()
+            ?? throw new InvalidOperationException("找不到 NearPickProfile 配置。");
+        var placeProfile = configuration.GetSection("PlaceProfile").Get<PlaceProfile>()
+            ?? throw new InvalidOperationException("找不到 PlaceProfile 配置。");
 
         await using IRobot robot = new Rm65Robot(profile);
 
@@ -71,10 +77,13 @@ class Program
             perception = new PythonWorkerPerception(appRoot, cameraProfile, visionModelProfile);
             Console.WriteLine("视觉 worker 已启动。");
 
-            // 创建固定点位采摘任务
+            // 创建固定点位采摘任务、远距靠近任务、近端采摘任务和放置任务
             pickTask = new FixedWaypointTask(taskProfile);
+            var farApproachTask = new FarApproachTask(profile, farApproachProfile);
+            var nearPickTask = new NearPickTask(profile, nearPickProfile);
+            var placeTask = new PlaceTask(profile, placeProfile);
 
-            var runner = new ArmTestRunner(robot, profile, gripper, perception, transformer, pickTask);
+            var runner = new ArmTestRunner(robot, profile, gripper, perception, transformer, pickTask, farApproachTask, nearPickTask, placeTask);
 
             using var cts = new CancellationTokenSource();
             Console.CancelKeyPress += (sender, e) =>
