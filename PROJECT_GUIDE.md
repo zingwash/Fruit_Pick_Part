@@ -64,6 +64,8 @@ flowchart LR
 | [`appsettings.json`](appsettings.json) | 当前实机配置中心。保存机械臂地址、Home 关节角、TCP 偏移、夹爪参数、相机、模型、标定路径、Far/Near 运动、固定点和放置点。修改后通常无需改 C# 代码。 |
 | [`README.md`](README.md) | 项目阶段、操作按键、功能变化和历史修改记录。 |
 | [`PROJECT_GUIDE.md`](PROJECT_GUIDE.md) | 本文档，负责解释目录、文件职责和代码调用关系。 |
+| [`BASELINE.md`](BASELINE.md) | 算法与架构优化前的稳定基准、维护分支和补丁版本规则。 |
+| [`启动桌面端.cmd`](启动桌面端.cmd) | 主目录下的一键启动入口。双击后直接打开桌面示教器；若 Release EXE 不存在，会先自动构建。 |
 
 ## 4. `App/`：控制台应用调度
 
