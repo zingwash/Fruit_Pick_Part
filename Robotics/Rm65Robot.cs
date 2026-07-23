@@ -266,7 +266,53 @@ public sealed class Rm65Robot : IStagedMotionRobot
         // flag=1 表示目标位姿使用欧拉角（RealMan 旧 C 接口约定）
         int ret = ArmAPI.Algo_Inverse_Kinematics(qIn, ref pose, qOut, 1);
         Console.WriteLine($"[IK] target={target}, ret={ret}");
+        if (ret != 0)
+        {
+            LogIkFailureDetails(ret, joints, qOut);
+        }
         return ret == 0;
+    }
+
+    /// <summary>
+    /// 打印 IK 失败时的诊断信息：当前关节角、IK 输出关节角、关节限位，
+    /// 并标出具体哪个关节超出限位（主要用于 ret=21 关节限位错误）。
+    /// </summary>
+    private void LogIkFailureDetails(int ret, double[] currentJoints, float[] qOut)
+    {
+        Console.WriteLine($"[IK] 失败码 {ret} 诊断：");
+        Console.WriteLine($"[IK] 当前关节角：[{string.Join(", ", currentJoints.Take(6).Select(j => j.ToString("F3")))}]");
+        Console.WriteLine($"[IK] 解算输出关节角：[{string.Join(", ", qOut.Take(6).Select(j => j.ToString("F3")))}]");
+
+        var minJoint = new float[7];
+        var maxJoint = new float[7];
+        int minRet = ArmAPI.Get_Joint_Min_Pos(_handle, minJoint);
+        int maxRet = ArmAPI.Get_Joint_Max_Pos(_handle, maxJoint);
+        if (minRet != 0 || maxRet != 0)
+        {
+            Console.WriteLine($"[IK] 获取关节限位失败：minRet={minRet}, maxRet={maxRet}");
+            return;
+        }
+
+        Console.WriteLine($"[IK] 关节最小限位：[{string.Join(", ", minJoint.Take(6).Select(j => j.ToString("F3")))}]");
+        Console.WriteLine($"[IK] 关节最大限位：[{string.Join(", ", maxJoint.Take(6).Select(j => j.ToString("F3")))}]");
+
+        for (int i = 0; i < 6; i++)
+        {
+            if (float.IsNaN(qOut[i]))
+            {
+                Console.WriteLine($"[IK] 关节 J{i + 1} 解算值为 NaN，无法判断限位。");
+                continue;
+            }
+
+            if (qOut[i] < minJoint[i])
+            {
+                Console.WriteLine($"[IK] 关节 J{i + 1} 低于下限：解={qOut[i]:F3}°，下限={minJoint[i]:F3}°，超出 {minJoint[i] - qOut[i]:F3}°");
+            }
+            else if (qOut[i] > maxJoint[i])
+            {
+                Console.WriteLine($"[IK] 关节 J{i + 1} 高于上限：解={qOut[i]:F3}°，上限={maxJoint[i]:F3}°，超出 {qOut[i] - maxJoint[i]:F3}°");
+            }
+        }
     }
 
     public async Task MoveToolStagedAsync(
@@ -326,7 +372,13 @@ public sealed class Rm65Robot : IStagedMotionRobot
             return Task.CompletedTask;
         }
 
-        ArmAPI.Move_Stop_Cmd(_handle, false);
+        int result = ArmAPI.Move_Stop_Cmd(_handle, false);
+        if (result != 0)
+        {
+            throw new InvalidOperationException($"软件停止请求发送失败，SDK Move_Stop_Cmd 返回码={result}。");
+        }
+
+        Console.WriteLine("[Rm65Robot] 软件停止请求已被 SDK 接受；这不代表已确认机械臂静止，也不能替代实体急停。");
         return Task.CompletedTask;
     }
 

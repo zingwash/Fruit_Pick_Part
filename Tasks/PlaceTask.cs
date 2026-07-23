@@ -31,13 +31,32 @@ public sealed class PlaceTask : IPickTask
         PickTaskContext? context = null)
     {
         ct.ThrowIfCancellationRequested();
+        bool gripperActionsEnabled = context?.DisableGripperActions != true;
+
+        if (context?.StrictAutomaticMode == true && gripperActionsEnabled)
+        {
+            if (gripper == null)
+            {
+                throw Abort("严格自动模式未配置夹爪，禁止开始放置运动。");
+            }
+
+            if (!gripper.IsConnected)
+            {
+                throw Abort("严格自动模式下夹爪未连接，禁止开始放置运动。");
+            }
+
+            if (!context.GripperPrepared)
+            {
+                throw Abort("严格自动模式下夹爪尚未完成通信及初始化准备，禁止开始放置运动。");
+            }
+        }
+
+        var boxApproach = ValidateConfiguredPose(_profile.BoxApproachPose, nameof(_profile.BoxApproachPose));
+        var boxPlace = ValidateConfiguredPose(_profile.BoxPlacePose, nameof(_profile.BoxPlacePose));
 
         // 1. 获取当前法兰位姿
         var currentFlangePose = await robot.GetToolPoseAsync(ct);
         Console.WriteLine($"[PlaceTask] 当前法兰位姿：{currentFlangePose}");
-
-        var boxApproach = _profile.BoxApproachPose.ToPose3D();
-        var boxPlace = _profile.BoxPlacePose.ToPose3D();
 
         Console.WriteLine($"[PlaceTask] 框靠近点：{boxApproach}");
         Console.WriteLine($"[PlaceTask] 框放置点：{boxPlace}");
@@ -61,8 +80,12 @@ public sealed class PlaceTask : IPickTask
         ct.ThrowIfCancellationRequested();
         Console.WriteLine("[PlaceTask] 已到达框放置点。");
 
-        // 4. 打开夹爪释放葡萄
-        if (gripper != null)
+        // 4. 可选打开夹爪。TeachPendant 运动验证流程通过上下文明确禁用全部夹爪动作。
+        if (!gripperActionsEnabled)
+        {
+            Console.WriteLine("[PlaceTask] 本轮上下文已禁用夹爪动作，跳过打开夹爪。");
+        }
+        else if (gripper != null)
         {
             Console.WriteLine("[PlaceTask] 打开夹爪释放葡萄...");
             await gripper.OpenAsync(cancellationToken: ct);
@@ -107,10 +130,54 @@ public sealed class PlaceTask : IPickTask
             Speed = _profile.HomeSpeed,
             BlockUntilComplete = true
         };
-        await robot.MoveJointsAsync(_robotProfile.HomeJoints, homeOptions, ct);
+        var homeJoints = GetValidatedHomeJoints();
+        await robot.MoveJointsAsync(homeJoints, homeOptions, ct);
         ct.ThrowIfCancellationRequested();
         Console.WriteLine("[PlaceTask] 已回到 Home。");
 
         Console.WriteLine("[PlaceTask] 放置完成。");
+    }
+
+    private static Pose3D ValidateConfiguredPose(PoseConfig? config, string name)
+    {
+        if (config == null)
+        {
+            throw Abort($"{name} 缺失。");
+        }
+
+        double[] values = [config.X, config.Y, config.Z, config.Rx, config.Ry, config.Rz];
+        if (values.Any(value => double.IsNaN(value) || double.IsInfinity(value)))
+        {
+            throw Abort($"{name} 包含 NaN 或 Infinity。");
+        }
+
+        if (values.All(value => Math.Abs(value) < 1e-12))
+        {
+            throw Abort($"{name} 是明显无效的全零默认位姿。");
+        }
+
+        return config.ToPose3D();
+    }
+
+    private static TaskAbortException Abort(string reason)
+    {
+        string message = $"[PlaceTask] 中止：{reason}";
+        Console.WriteLine(message);
+        return new TaskAbortException(message);
+    }
+
+    /// <summary>
+    /// 获取校验后的 Home 关节角数组。若配置无效，打印警告并返回默认值。
+    /// </summary>
+    private double[] GetValidatedHomeJoints()
+    {
+        var joints = _robotProfile.HomeJoints;
+        if (joints != null && joints.Count == _robotProfile.JointDof)
+        {
+            return joints.ToArray();
+        }
+
+        Console.WriteLine($"[Warning] RobotProfile.HomeJoints 配置无效（count={joints?.Count ?? 0}，期望 {_robotProfile.JointDof}），使用默认 Home 关节角。请检查 appsettings.json 的 RobotProfile.HomeJoints。");
+        return [1.742, 56.596, -48.264, 2.579, -89.552, -5.975];
     }
 }

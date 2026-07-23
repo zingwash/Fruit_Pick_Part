@@ -2,7 +2,7 @@
 启动一次 RealSense D435/D435i，在限定时间内连续抓帧，使用 near_pose_line YOLO pose 模型检测葡萄，并打印结构化结果。
 
 输出范围：
-- 只返回模型类别为 grape_bunch 的 detection；
+- 接受模型类别为 grape_far 或 grape_close 的 detection；
 - 每个 detection 输出 class_id / class_name / box_center / keypoint_0 / keypoint_1 / keypoint_2；
 - 不管 trusted=true/false，始终输出 core_point，方便观察 uv/z/true/false；
 - core_point.uv 为 K0 到 K2 连线上的比例点；
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from datetime import datetime
@@ -33,7 +34,7 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_MODEL_PATH = ROOT / "models" / "near_pose_line.pt"
 DEFAULT_OUTPUT_DIR = ROOT / "outputs" / "near_pose_line"
 KEYPOINT_COUNT = 3
-TARGET_CLASS_NAME = "grape_bunch"
+TARGET_CLASS_NAMES = {"grape_far", "grape_close"}
 DEFAULT_Z_OUTLIER_THRESHOLD_M = 0.10
 DEFAULT_CORE_POINT_RATIO_K0_TO_K2 = 0.2
 MIN_VALID_DEPTH_M = 0.20
@@ -60,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO 推理尺寸")
     parser.add_argument("--device", type=str, default=None, help="推理设备，例如 cpu、0；默认自动选择")
     parser.add_argument("--compact", action="store_true", help="输出压缩 JSON；默认输出人眼可读格式，且点对象横向显示")
+    parser.add_argument("--selection-rule", type=str, default="largest_nearest_lowest_top", choices=["nearest_center_z", "nearest_image_center", "nearest_comprehensive", "max_confidence", "lowest_top_edge", "highest_top_edge", "largest_nearest_lowest_top"], help="目标选择规则；默认优先面积大、距离近且上边框靠上的葡萄串")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="将本次检测结果保存为 JSON 的目录")
     return parser.parse_args()
 
@@ -236,14 +238,19 @@ def extract_grape_outputs(
     grapes: list[dict[str, Any]] = []
     for i, class_id in enumerate(class_ids):
         class_name = names.get(int(class_id), str(class_id))
-        if class_name != TARGET_CLASS_NAME:
+        if class_name not in TARGET_CLASS_NAMES:
             continue
 
-        x1, y1, x2, y2 = boxes_xyxy[i]
-        center_x = (float(x1) + float(x2)) / 2.0
-        center_y = (float(y1) + float(y2)) / 2.0
-
+        x1, y1, x2, y2 = [float(v) for v in boxes_xyxy[i]]
+        center_x = (x1 + x2) / 2.0
+        center_y = (y1 + y2) / 2.0
         if rotate_180:
+            x1, y1, x2, y2 = (
+                image_width - 1 - x2,
+                image_height - 1 - y2,
+                image_width - 1 - x1,
+                image_height - 1 - y1,
+            )
             center_x, center_y = convert_uv_rotated_to_original(
                 center_x, center_y, image_width, image_height
             )
@@ -307,6 +314,14 @@ def extract_grape_outputs(
             "class_id": int(class_id),
             "class_name": class_name,
             "trusted": bool(grape_trusted),
+            "bbox": {
+                "xyxy": [int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))],
+                "center_uv": [int(round(center_x)), int(round(center_y))],
+                "top_center_uv": [int(round(top_center_x)), int(round(top_center_y))],
+                "center_z": box_center.get("z"),
+                "confidence": rounded_float(float(box_confs[i])),
+                "trusted": bool(grape_trusted),
+            },
             "box_center": box_center,
             "top_center": top_center,
         }
@@ -345,17 +360,142 @@ def extract_grape_outputs(
     return grapes
 
 
-def build_output(frame: np.ndarray, grapes: list[dict[str, Any]], elapsed_seconds: float) -> dict[str, Any]:
+def _default_selection_weights() -> dict[str, float]:
+    return {"area": 0.3, "distance": 0.2, "top_edge": 0.5}
+
+
+def _get_selection_weights(
+    selection_weights: dict[str, Any] | None,
+) -> dict[str, float]:
+    weights = _default_selection_weights()
+    if selection_weights is None:
+        return weights
+    for key in weights:
+        value = selection_weights.get(key)
+        if value is not None:
+            try:
+                weights[key] = float(value)
+            except (TypeError, ValueError):
+                pass
+    return weights
+
+
+def select_grape(
+    grapes: list[dict[str, Any]],
+    selection_rule: str,
+    image_width: int,
+    image_height: int,
+    selection_weights: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """在可信葡萄串中选择目标。规则与 far bbox 保持一致。"""
     trusted_grapes = [
         grape for grape in grapes
         if bool(grape.get("trusted"))
         and isinstance(grape.get("core_point"), dict)
         and bool(grape["core_point"].get("trusted"))
     ]
+    if not trusted_grapes:
+        return None
+
+    if selection_rule == "largest_nearest_lowest_top":
+        # 优先面积大、距离近且上边框靠上的葡萄串。
+        # 面积使用 bbox 像素面积（越大越好）；距离使用 top_center.z（米，越小越好）；
+        # 上边框靠上使用 top_center_uv 的 v 值（越小越好，即原始图像中越靠上；
+        # 由于相机倒置 180°，原始图像上方对应物理空间下方）。
+        # 权重由调用方通过 selection_weights 指定，默认面积 0.3 + 距离 0.2 + 上边框靠上 0.5。
+        weights = _get_selection_weights(selection_weights)
+        areas = [
+            float((grape["bbox"]["xyxy"][2] - grape["bbox"]["xyxy"][0])
+                  * (grape["bbox"]["xyxy"][3] - grape["bbox"]["xyxy"][1]))
+            for grape in trusted_grapes
+        ]
+        max_area = max(areas) if areas else 1.0
+        min_z = min(float(grape["top_center"]["z"]) for grape in trusted_grapes if grape["top_center"].get("z") is not None)
+        min_top_v = min(float(grape["bbox"]["top_center_uv"][1]) for grape in trusted_grapes)
+        max_top_v = max(float(grape["bbox"]["top_center_uv"][1]) for grape in trusted_grapes)
+        range_top_v = max_top_v - min_top_v
+
+        def combined_score(grape: dict[str, Any]) -> float:
+            area = float((grape["bbox"]["xyxy"][2] - grape["bbox"]["xyxy"][0])
+                         * (grape["bbox"]["xyxy"][3] - grape["bbox"]["xyxy"][1]))
+            z = grape["top_center"].get("z")
+            top_v = float(grape["bbox"]["top_center_uv"][1])
+            norm_area = area / max_area if max_area > 0 else 0.0
+            norm_distance = min_z / z if z is not None and z > 0 else 0.0
+            norm_top_v = (max_top_v - top_v) / range_top_v if range_top_v > 0 else 1.0
+            return (
+                weights["area"] * norm_area
+                + weights["distance"] * norm_distance
+                + weights["top_edge"] * norm_top_v
+            )
+
+        return max(trusted_grapes, key=combined_score)
+
+    if selection_rule == "lowest_top_edge":
+        return max(
+            trusted_grapes,
+            key=lambda grape: float(grape["bbox"]["top_center_uv"][1]),
+        )
+
+    if selection_rule == "highest_top_edge":
+        # 优先选择上边框靠上的葡萄串：top_center 在原始相机坐标系中的 v 值越小越靠上。
+        # 由于相机倒置 180°，原始图像顶边对应物理空间下方。
+        return min(
+            trusted_grapes,
+            key=lambda grape: float(grape["bbox"]["top_center_uv"][1]),
+        )
+
+    if selection_rule == "max_confidence":
+        return max(trusted_grapes, key=lambda grape: float(grape["bbox"].get("confidence", 0.0)))
+
+    if selection_rule == "nearest_image_center":
+        center_u = image_width / 2.0
+        center_v = image_height / 2.0
+        return min(
+            trusted_grapes,
+            key=lambda grape: math.hypot(
+                float(grape["bbox"]["center_uv"][0]) - center_u,
+                float(grape["bbox"]["center_uv"][1]) - center_v,
+            ),
+        )
+
+    if selection_rule == "nearest_comprehensive":
+        center_u = image_width / 2.0
+        center_v = image_height / 2.0
+        max_center_dist = math.hypot(center_u, center_v)
+        if max_center_dist <= 0:
+            return min(trusted_grapes, key=lambda grape: float(grape["top_center"]["z"]))
+
+        def comprehensive_score(grape: dict[str, Any]) -> float:
+            z = float(grape["top_center"]["z"])
+            u = float(grape["bbox"]["center_uv"][0])
+            v = float(grape["bbox"]["center_uv"][1])
+            center_dist = math.hypot(u - center_u, v - center_v)
+            normalized_center_dist = center_dist / max_center_dist
+            return z + 0.3 * normalized_center_dist
+
+        return min(trusted_grapes, key=comprehensive_score)
+
+    # 默认 nearest_center_z：使用 top_center 深度，越小越好
+    return min(
+        trusted_grapes,
+        key=lambda grape: float(grape["top_center"]["z"]) if grape["top_center"].get("z") is not None else float("inf"),
+    )
+
+
+def build_output(frame: np.ndarray, grapes: list[dict[str, Any]], elapsed_seconds: float, selection_rule: str, selection_weights: dict[str, Any] | None = None) -> dict[str, Any]:
+    trusted_grapes = [
+        grape for grape in grapes
+        if bool(grape.get("trusted"))
+        and isinstance(grape.get("core_point"), dict)
+        and bool(grape["core_point"].get("trusted"))
+    ]
+    selected_grape = select_grape(grapes, selection_rule, int(frame.shape[1]), int(frame.shape[0]), selection_weights)
     return {
         "trusted": len(trusted_grapes) > 0,
         "trusted_grape_count": len(trusted_grapes),
-        "selection_rule": "csharp_selects_nearest_to_end_from_trusted_grapes",
+        "selected_grape_index": None if selected_grape is None else int(selected_grape["index"]),
+        "selection_rule": selection_rule,
         "image": {
             "width": int(frame.shape[1]),
             "height": int(frame.shape[0]),
@@ -415,7 +555,7 @@ def run_until_trusted(rs: Any, model: Any, names: dict[int, str], args: argparse
                 args.core_point_ratio_k0_to_k2,
             )
             now = time.monotonic()
-            output = build_output(frame, grapes, now - start_time)
+            output = build_output(frame, grapes, now - start_time, args.selection_rule)
             if has_trusted_grape(output) or now >= deadline:
                 return output
     except RuntimeError as exc:

@@ -38,8 +38,11 @@ public sealed record NearDetectionResult
 {
     public bool Trusted { get; init; }
     public int TrustedCount { get; init; }
+    public int SelectedIndex { get; init; } = -1;
     public IReadOnlyList<DetectedTarget> Targets { get; init; } = Array.Empty<DetectedTarget>();
     public DetectedTarget? SelectedTarget { get; init; }
+    /// <summary>本次检测的带标注 JPEG，仅用于桌面显示，不参与运动计算。</summary>
+    public byte[]? PreviewImageJpeg { get; init; }
 }
 
 /// <summary>
@@ -52,4 +55,21 @@ public sealed record FarDetectionResult
     public int SelectedIndex { get; init; } = -1;
     public IReadOnlyList<DetectedTarget> Targets { get; init; } = Array.Empty<DetectedTarget>();
     public DetectedTarget? SelectedTarget { get; init; }
+    /// <summary>本次检测的带标注 JPEG，仅用于桌面显示，不参与运动计算。</summary>
+    public byte[]? PreviewImageJpeg { get; init; }
+}
+
+/// <summary>Python worker 完成一次检测后发布的桌面预览帧。</summary>
+public sealed class VisionPreviewFrameEventArgs : EventArgs
+{
+    public VisionPreviewFrameEventArgs(string mode, byte[] jpegBytes, DateTimeOffset capturedAt)
+    {
+        Mode = mode;
+        JpegBytes = jpegBytes;
+        CapturedAt = capturedAt;
+    }
+
+    public string Mode { get; }
+    public byte[] JpegBytes { get; }
+    public DateTimeOffset CapturedAt { get; }
 }

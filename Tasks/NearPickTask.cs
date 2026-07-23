@@ -7,9 +7,9 @@ namespace FruitPickPart.Tasks;
 
 /// <summary>
 /// 近端采摘任务。
-/// 优先基于 near pose line 模型的 core_point 移动到采摘点；
-/// 当 core_point 识别失败时，回退到 bbox 上边中点 top_center，并向上偏移 2cm 去采摘；
-/// 当任务上下文要求 UseFarFallback 时，改用远端 far bbox 的 top_center，向上偏移 2cm 去采摘。
+/// 基于 near bbox 模型输出的葡萄串框上边中点 top_center 计算采摘点，
+/// 并在图像上方偏移 StemOffsetAboveCorePointM（默认 2cm）去采摘。
+/// 当任务上下文要求 UseFarFallback 或 near 识别失效时，回退使用远端 far bbox 的 top_center。
 /// 采摘过程中保持当前末端姿态不变（仅位置变化，工具 Z 不对准目标）。
 /// </summary>
 public sealed class NearPickTask : IPickTask
@@ -25,6 +25,12 @@ public sealed class NearPickTask : IPickTask
 
     public string Name => _profile.Name;
 
+    /// <summary>
+    /// 采摘参考点封装。携带该图像点应该使用哪一时刻的机械臂末端位姿转换到 Base，
+    /// 以解决 eye-in-hand 场景下机器人移动后重新转换 far 图像点带来的横向偏差。
+    /// </summary>
+    private readonly record struct PickReference(ImagePoint ImagePoint, string Name, Pose3D TransformFlangePose);
+
     public async Task ExecuteAsync(
         IRobot robot,
         IGripper? gripper,
@@ -35,14 +41,41 @@ public sealed class NearPickTask : IPickTask
     {
         if (perception == null)
         {
-            Console.WriteLine("[NearPickTask] 未配置视觉感知，无法执行近端采摘。");
-            return;
+            throw Abort("未配置视觉感知，无法执行近端采摘。");
         }
 
         if (transformer == null)
         {
-            Console.WriteLine("[NearPickTask] 未配置坐标转换器，无法执行近端采摘。");
-            return;
+            throw Abort("未配置坐标转换器，无法执行近端采摘。");
+        }
+
+        bool gripperActionsEnabled = context?.DisableGripperActions != true;
+        if (gripperActionsEnabled && gripper == null)
+        {
+            throw Abort("未配置夹爪；为避免机械臂先运动、到采摘点后才发现无法夹取，本阶段不允许开始。");
+        }
+
+        if (gripperActionsEnabled && gripper?.IsConnected != true)
+        {
+            throw Abort("夹爪未连接；近端采摘不允许开始。");
+        }
+
+        if (context?.StrictAutomaticMode == true)
+        {
+            if (gripperActionsEnabled && !context.GripperPrepared)
+            {
+                throw Abort("严格自动模式下夹爪尚未完成通信及初始化准备。");
+            }
+
+            if (!context.DisableManualFallback)
+            {
+                throw Abort("严格自动模式必须禁用视觉手动回退。");
+            }
+
+            if (!IsValidFarResult(context.FarResult) || !context.FarDetectionFlangePose.HasValue)
+            {
+                throw Abort("严格自动模式缺少本轮可信 Far 结果或 Far 检测时法兰位姿。");
+            }
         }
 
         ct.ThrowIfCancellationRequested();
@@ -51,70 +84,101 @@ public sealed class NearPickTask : IPickTask
         var currentFlangePose = await robot.GetToolPoseAsync(ct);
         Console.WriteLine($"[NearPickTask] 当前法兰位姿：{currentFlangePose}");
 
-        // 2. 解析采摘参考点：优先 near core_point / top_center，必要时回退到 far top_center
-        var (pickReferencePoint, pickReferenceName) = await ResolvePickReferenceAsync(
+        // 若启用固定采摘姿态，使用配置的欧拉角作为末端姿态参考，位置仍取当前位置
+        Pose3D orientationReferencePose = currentFlangePose;
+        if (_profile.UseFixedPickOrientation)
+        {
+            orientationReferencePose = currentFlangePose with
+            {
+                Rx = _profile.FixedPickRx,
+                Ry = _profile.FixedPickRy,
+                Rz = _profile.FixedPickRz,
+            };
+            Console.WriteLine($"[NearPickTask] 使用固定采摘姿态：{orientationReferencePose}");
+        }
+
+        // 2. 解析采摘参考点：使用 near bbox 的 top_center，必要时回退到 far top_center。
+        //    回退时必须使用 far 检测时刻的法兰位姿做坐标转换，否则会产生横向偏移。
+        var pickReference = await ResolvePickReferenceAsync(
             perception,
             transformer,
             currentFlangePose,
             context,
             ct);
 
-        // 4. 采摘参考点 → Base，并在相机坐标系 Y 方向（图像上下方向）向上偏移 StemOffsetAboveCorePointM（默认 2cm）
+        // 4. 采摘参考点 → Base，并在相机坐标系 Y 方向（图像上下方向）向上偏移 StemOffsetAboveCorePointM
         var pickBasePose = transformer.ImagePointToBase(
-            pickReferencePoint,
-            currentFlangePose,
+            pickReference.ImagePoint,
+            pickReference.TransformFlangePose,
             -_profile.StemOffsetAboveCorePointM);
         if (pickBasePose == null)
         {
-            Console.WriteLine($"[NearPickTask] {pickReferenceName} 转换到 Base 失败，跳过。");
-            return;
+            throw Abort($"{pickReference.Name} 转换到 Base 失败，不能继续采摘运动。");
         }
 
         var pickBase = pickBasePose.Value;
-        Console.WriteLine($"[NearPickTask] {pickReferenceName} in Base（已上偏 {_profile.StemOffsetAboveCorePointM * 100:F0}cm）：{pickBase}");
+        Console.WriteLine($"[NearPickTask] {pickReference.Name} in Base（已上偏 {_profile.StemOffsetAboveCorePointM * 100:F0}cm）：{pickBase}");
 
         // 5. 计算最终采摘位姿：TCP 在 pickBase + TcpInsertionDepthM 处
         // 注意：近端采摘强制保持当前末端姿态不变（工具 Z 不对准目标）
         const bool preserveEndEffectorOrientation = true;
-        var pickFlangePose = ComputeFlangePoseForTcpAt(
-            currentFlangePose,
-            pickBase,
-            _robotProfile.TcpOffsetZ,
-            _profile.TcpInsertionDepthM,
-            alignToolZToTarget: !preserveEndEffectorOrientation);
+        Pose3D pickFlangePose;
+        Pose3D referenceFlangePose;
+        Pose3D approachFlangePose;
+        try
+        {
+            pickFlangePose = ComputeFlangePoseForTcpAt(
+                orientationReferencePose,
+                pickBase,
+                _robotProfile.TcpOffsetZ,
+                _profile.TcpInsertionDepthM,
+                alignToolZToTarget: !preserveEndEffectorOrientation);
 
-        // 限制工具 Z 正方向最大前进距离
-        pickFlangePose = PoseUtils.ClampTcpAlongToolZ(
-            currentFlangePose,
-            pickFlangePose,
-            _robotProfile.TcpOffsetZ,
-            _profile.MaxToolZForwardTravelM,
-            "NearPickTask");
+            // 限制工具 Z 正方向最大前进距离
+            pickFlangePose = PoseUtils.ClampTcpAlongToolZ(
+                currentFlangePose,
+                pickFlangePose,
+                _robotProfile.TcpOffsetZ,
+                _profile.MaxToolZForwardTravelM,
+                "NearPickTask");
+
+            // 6. 计算参考点处的法兰位姿：TCP 刚好位于 pickBase（未往前伸入葡萄）
+            referenceFlangePose = ComputeFlangePoseForTcpAt(
+                orientationReferencePose,
+                pickBase,
+                _robotProfile.TcpOffsetZ,
+                tcpInsertionDepthM: 0.0,
+                alignToolZToTarget: !preserveEndEffectorOrientation);
+
+            // 7. 计算靠近点：从 referenceFlangePose 沿工具 Z 反方向退 ApproachClearanceM。
+            approachFlangePose = ComputeApproachFlangePose(referenceFlangePose, _profile.ApproachClearanceM);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw Abort("采摘目标位姿计算失败，不能进入运动阶段。", ex);
+        }
 
         Console.WriteLine($"[NearPickTask] 采摘目标法兰位姿：{pickFlangePose}");
-
-        // 6. 计算参考点处的法兰位姿：TCP 刚好位于 pickBase（未往前伸入葡萄）
-        var referenceFlangePose = ComputeFlangePoseForTcpAt(
-            currentFlangePose,
-            pickBase,
-            _robotProfile.TcpOffsetZ,
-            tcpInsertionDepthM: 0.0,
-            alignToolZToTarget: !preserveEndEffectorOrientation);
-
-        // 7. 计算靠近点：从 referenceFlangePose 沿工具 Z 反方向退 ApproachClearanceM，
-        //    确保靠近阶段 TCP 位于葡萄前方，不会先往葡萄深处移动。
-        var approachFlangePose = ComputeApproachFlangePose(referenceFlangePose, _profile.ApproachClearanceM);
         Console.WriteLine($"[NearPickTask] 靠近点法兰位姿：{approachFlangePose}");
 
-        // 8. 打开夹爪（如已启用）
-        if (gripper != null)
+        // 8. 可选打开夹爪。TeachPendant 运动验证流程通过上下文明确禁用全部夹爪动作。
+        if (gripperActionsEnabled)
         {
             Console.WriteLine("[NearPickTask] 打开夹爪...");
-            await gripper.OpenAsync(cancellationToken: ct);
+            await gripper!.OpenAsync(cancellationToken: ct);
+            ct.ThrowIfCancellationRequested();
             if (_profile.GripperOpenDelayMs > 0)
             {
                 await Task.Delay(_profile.GripperOpenDelayMs, ct);
             }
+        }
+        else
+        {
+            Console.WriteLine("[NearPickTask] 本轮上下文已禁用夹爪动作，跳过打开夹爪。");
         }
 
         // 9. 先移动到靠近点：分两段，先工具 X/Y，再工具 Z，避免直接插向葡萄/葡萄梗
@@ -126,25 +190,81 @@ public sealed class NearPickTask : IPickTask
             Speed = _profile.ApproachSpeed,
             MoveMode = MoveMode.Linear,
             BlockUntilComplete = true,
-            AllowLinearToPoseFallback = true
+            AllowLinearToPoseFallback = context?.AllowLinearToPoseFallback ?? true
         };
 
-        var approachXyOnlyPose = PoseUtils.ComputeToolXyOnlyPose(currentFlangePose, approachFlangePose);
+        var approachXyOnlyPose = PoseUtils.ComputeToolXyOnlyPose(orientationReferencePose, approachFlangePose);
         Console.WriteLine($"[NearPickTask] 工具 XY 阶段法兰位姿：{approachXyOnlyPose}");
-        await robot.MoveToolAsync(approachXyOnlyPose, new MoveOptions
-        {
-            Speed = _profile.ApproachSpeed,
-            MoveMode = approachMoveMode,
-            BlockUntilComplete = true
-        }, ct);
-        ct.ThrowIfCancellationRequested();
-        Console.WriteLine("[NearPickTask] 已完成工具 XY 阶段。");
 
-        Console.WriteLine($"[NearPickTask] 工具 Z 阶段法兰位姿：{approachFlangePose}");
-        await EnsureLinearPathReachableAsync(robot, approachXyOnlyPose, approachFlangePose, ct);
-        await robot.MoveToolAsync(approachFlangePose, toolZMoveOptions, ct);
-        ct.ThrowIfCancellationRequested();
-        Console.WriteLine("[NearPickTask] 已到达靠近点。");
+        bool useXyStaged = true;
+        if (robot is IStagedMotionRobot stagedCheck && _profile.UseIkPreCheck)
+        {
+            useXyStaged = await stagedCheck.IsPoseReachableAsync(approachXyOnlyPose, ct);
+        }
+
+        if (useXyStaged)
+        {
+            await robot.MoveToolAsync(approachXyOnlyPose, new MoveOptions
+            {
+                Speed = _profile.ApproachSpeed,
+                MoveMode = approachMoveMode,
+                BlockUntilComplete = true
+            }, ct);
+            ct.ThrowIfCancellationRequested();
+            Console.WriteLine("[NearPickTask] 已完成工具 XY 阶段。");
+
+            Console.WriteLine($"[NearPickTask] 工具 Z 阶段法兰位姿：{approachFlangePose}");
+            await EnsureLinearPathReachableAsync(robot, approachXyOnlyPose, approachFlangePose, ct);
+            await robot.MoveToolAsync(approachFlangePose, toolZMoveOptions, ct);
+            ct.ThrowIfCancellationRequested();
+            Console.WriteLine("[NearPickTask] 已到达靠近点。");
+        }
+        else
+        {
+            // XY 同时不可达时，fallback 到“中间点（XYZ 同时动）→ XY → Z”
+            Console.WriteLine($"[NearPickTask] 工具 XY 阶段目标不可达，尝试先移动到可达中间点。xyOnlyPose={approachXyOnlyPose}");
+
+            if (robot is not IStagedMotionRobot stagedIntermediate)
+            {
+                throw new InvalidOperationException("[NearPickTask] 当前机械臂不支持 IK 预检查，无法搜索中间点。");
+            }
+
+            var intermediate = await FindReachableIntermediateAsync(stagedIntermediate, orientationReferencePose, approachFlangePose, ct);
+            if (!intermediate.HasValue)
+            {
+                throw new InvalidOperationException("[NearPickTask] 未找到可达中间点。");
+            }
+
+            var intermediatePose = intermediate.Value;
+
+            // 阶段 1b：先 XYZ 同时移动到中间点
+            Console.WriteLine($"[NearPickTask] 中间点（XYZ 同时动）：{intermediatePose}");
+            await robot.MoveToolAsync(intermediatePose, new MoveOptions
+            {
+                Speed = _profile.ApproachSpeed,
+                MoveMode = approachMoveMode,
+                BlockUntilComplete = true
+            }, ct);
+            ct.ThrowIfCancellationRequested();
+
+            // 阶段 1c：从中间点执行工具 XY 阶段
+            var xyFromIntermediate = PoseUtils.ComputeToolXyOnlyPose(intermediatePose, approachFlangePose);
+            Console.WriteLine($"[NearPickTask] 中间点工具 XY 阶段法兰位姿：{xyFromIntermediate}");
+            await robot.MoveToolAsync(xyFromIntermediate, new MoveOptions
+            {
+                Speed = _profile.ApproachSpeed,
+                MoveMode = approachMoveMode,
+                BlockUntilComplete = true
+            }, ct);
+            ct.ThrowIfCancellationRequested();
+            Console.WriteLine("[NearPickTask] 已完成工具 XY 阶段。");
+
+            Console.WriteLine($"[NearPickTask] 工具 Z 阶段法兰位姿：{approachFlangePose}");
+            await EnsureLinearPathReachableAsync(robot, xyFromIntermediate, approachFlangePose, ct);
+            await robot.MoveToolAsync(approachFlangePose, toolZMoveOptions, ct);
+            ct.ThrowIfCancellationRequested();
+            Console.WriteLine("[NearPickTask] 已到达靠近点。");
+        }
 
         // 10. 再沿工具 Z 前进到采摘点，姿态保持不变
         Console.WriteLine($"[NearPickTask] 采摘阶段法兰位姿：{pickFlangePose}");
@@ -154,10 +274,14 @@ public sealed class NearPickTask : IPickTask
         Console.WriteLine("[NearPickTask] 已到达采摘点。");
 
         // 11. 闭合夹爪（默认关闭，方便先测试运动轨迹）
-        if (gripper != null && _profile.CloseGripperOnPick)
+        if (!gripperActionsEnabled)
+        {
+            Console.WriteLine("[NearPickTask] 本轮上下文已禁用夹爪动作，跳过关闭夹爪。");
+        }
+        else if (_profile.CloseGripperOnPick)
         {
             Console.WriteLine($"[NearPickTask] 闭合夹爪到 {_profile.GripperClosePosition}%，力度 {_profile.GripperCloseForce}%...");
-            await gripper.CloseAsync(
+            await gripper!.CloseAsync(
                 position: _profile.GripperClosePosition,
                 force: _profile.GripperCloseForce,
                 cancellationToken: ct);
@@ -182,7 +306,8 @@ public sealed class NearPickTask : IPickTask
             {
                 Speed = _profile.RetreatSpeed,
                 MoveMode = MoveMode.Linear,
-                BlockUntilComplete = true
+                BlockUntilComplete = true,
+                AllowLinearToPoseFallback = context?.AllowLinearToPoseFallback ?? true
             };
 
             await EnsureLinearPathReachableAsync(robot, pickFlangePose, retreatFlangePose, ct);
@@ -191,90 +316,33 @@ public sealed class NearPickTask : IPickTask
             Console.WriteLine("[NearPickTask] 撤离完成。");
         }
 
+        // 13. 回 Home（关节空间运动）：采摘后以固定构型回到 Home，再进入后续放置任务，路径可重复
+        if (_profile.ReturnHomeAfterPick && _robotProfile.HomeJoints.Count == _robotProfile.JointDof)
+        {
+            Console.WriteLine($"[NearPickTask] 回 Home：joints=[{string.Join(", ", _robotProfile.HomeJoints.Select(j => j.ToString("F1")))}]");
+            await robot.MoveJointsAsync(_robotProfile.HomeJoints.ToArray(), new MoveOptions
+            {
+                Speed = _profile.HomeSpeed,
+                BlockUntilComplete = true
+            }, ct);
+            ct.ThrowIfCancellationRequested();
+            Console.WriteLine("[NearPickTask] 已回到 Home。");
+        }
+
         Console.WriteLine("[NearPickTask] 近端采摘完成。");
-    }
-
-    private static DetectedTarget? SelectNearestTargetWithFallback(
-        IReadOnlyList<DetectedTarget> targets,
-        Pose3D currentFlangePose,
-        ICoordinateTransformer transformer)
-    {
-        // 第一优先级：可信且 core_point 有效的目标
-        DetectedTarget? bestCore = null;
-        double bestCoreDistanceSq = double.PositiveInfinity;
-
-        // 第二优先级：有有效 top_center 的目标（core_point 识别失败时回退使用，不要求 grape trusted）
-        DetectedTarget? bestTopCenter = null;
-        double bestTopCenterDistanceSq = double.PositiveInfinity;
-
-        double[] currentPos = [currentFlangePose.X, currentFlangePose.Y, currentFlangePose.Z];
-
-        foreach (var target in targets)
-        {
-            if (target.Center != null && target.Center.IsValid && target.Center.DepthM > 0)
-            {
-                var basePose = transformer.ImagePointToBase(target.Center, currentFlangePose);
-                if (basePose != null)
-                {
-                    double dx = basePose.Value.X - currentPos[0];
-                    double dy = basePose.Value.Y - currentPos[1];
-                    double dz = basePose.Value.Z - currentPos[2];
-                    double distanceSq = dx * dx + dy * dy + dz * dz;
-
-                    if (target.Trusted && distanceSq < bestCoreDistanceSq)
-                    {
-                        bestCoreDistanceSq = distanceSq;
-                        bestCore = target;
-                    }
-                }
-            }
-
-            if (target.TopCenter != null && target.TopCenter.IsValid && target.TopCenter.DepthM > 0)
-            {
-                var basePose = transformer.ImagePointToBase(target.TopCenter, currentFlangePose);
-                if (basePose != null)
-                {
-                    double dx = basePose.Value.X - currentPos[0];
-                    double dy = basePose.Value.Y - currentPos[1];
-                    double dz = basePose.Value.Z - currentPos[2];
-                    double distanceSq = dx * dx + dy * dy + dz * dz;
-
-                    if (distanceSq < bestTopCenterDistanceSq)
-                    {
-                        bestTopCenterDistanceSq = distanceSq;
-                        bestTopCenter = target;
-                    }
-                }
-            }
-        }
-
-        if (bestCore != null)
-        {
-            Console.WriteLine($"[NearPickTask] 选中 core_point 目标 index={bestCore.Index}, distance={Math.Sqrt(bestCoreDistanceSq):F4}m");
-            return bestCore;
-        }
-
-        if (bestTopCenter != null)
-        {
-            Console.WriteLine($"[NearPickTask] core_point 均无效，回退使用 bbox top_center 目标 index={bestTopCenter.Index}, distance={Math.Sqrt(bestTopCenterDistanceSq):F4}m");
-            return bestTopCenter;
-        }
-
-        return null;
     }
 
     /// <summary>
     /// 解析本次采摘的图像参考点。
     ///
     /// 流程：
-    /// 1. 优先尝试 near pose line 检测，得到 core_point 或 top_center；
-    /// 2. 若 near 识别成功，用远端靠近阶段保存的 far top_center 做偏差校验：
-    ///    若 near 采摘点与 far top_center 在 Base 下距离 > 0.5cm，则判定 near 失效；
-    /// 3. 若 near 失败或偏离过大：
-    ///    - 优先做一次新的 far 检测（自动失败则进入手动标定）；
-    ///    - 若新的 far 检测失败，回退使用远端靠近阶段保存的 far top_center。
+    /// 1. 优先尝试 near bbox 检测，得到葡萄串框上边中点 top_center；
+    /// 2. 若 near 识别成功，用远端靠近阶段保存的 far top_center（使用 far 检测时刻的法兰位姿转换到 Base）做偏差校验：
+    ///    若 near top_center 与 far top_center 在 Base 下距离 > 阈值，则判定 near 失效；
+    /// 3. 若 near 失败或偏离过大，直接使用远端靠近阶段保存的 far top_center，
+    ///    并仍使用 far 检测时刻的法兰位姿进行坐标转换，避免机器人移动后重新转换带来的横向偏差。
     /// </summary>
-    private async Task<(ImagePoint PickReferencePoint, string PickReferenceName)> ResolvePickReferenceAsync(
+    private async Task<PickReference> ResolvePickReferenceAsync(
         IPerception perception,
         ICoordinateTransformer transformer,
         Pose3D currentFlangePose,
@@ -287,47 +355,48 @@ public sealed class NearPickTask : IPickTask
 
         if (!useFarFallback)
         {
-            // 请求 near pose line 检测（若 Runner 已提供结果，则直接复用）
+            // 请求 near bbox 检测（若 Runner 已提供结果，则直接复用）
             NearDetectionResult? nearResult = context?.NearResult;
 
             if (nearResult == null)
             {
-                Console.WriteLine("[NearPickTask] 请求 near pose line 检测...");
-                nearResult = await perception.CaptureNearAsync(forceManual: false, allowManualFallback: false, cancellationToken: ct);
+                Console.WriteLine("[NearPickTask] 请求 near bbox 检测...");
+                nearResult = await perception.CaptureNearAsync(forceManual: false, allowManualFallback: false, selectionRule: _profile.SelectionRule, selectionWeights: _profile.SelectionWeights, cancellationToken: ct);
             }
             else
             {
                 Console.WriteLine("[NearPickTask] 使用 Runner 提供的 near 检测结果。");
             }
 
-            if (nearResult == null || nearResult.Targets.Count == 0)
+            // 将本轮实际收到的 Near 结果写回同一上下文，仅供流程状态和审计显示；不改变目标选择规则。
+            if (context != null)
             {
-                Console.WriteLine("[NearPickTask] near 检测无结果，切换到远端回退。");
+                context.NearResult = nearResult;
+            }
+
+            if (nearResult == null || nearResult.Targets.Count == 0 || !nearResult.Trusted)
+            {
+                Console.WriteLine("[NearPickTask] near 检测无可信结果，切换到本轮 Far 回退。");
             }
             else
             {
                 Console.WriteLine($"[NearPickTask] near 检测结果：trusted={nearResult.Trusted}, targets={nearResult.Targets.Count}");
 
-                var selectedTarget = SelectNearestTargetWithFallback(nearResult.Targets, currentFlangePose, transformer);
-                if (selectedTarget == null)
+                // 使用 Python 明确返回的 SelectedTarget；任务层不再按 Base 距离静默改选目标。
+                var selectedTarget = nearResult.SelectedTarget;
+                if (selectedTarget == null
+                    || !selectedTarget.Trusted
+                    || selectedTarget.TopCenter == null
+                    || !selectedTarget.TopCenter.IsValid
+                    || selectedTarget.TopCenter.DepthM <= 0)
                 {
-                    Console.WriteLine("[NearPickTask] 没有有效 core_point 或 top_center 目标，切换到远端回退。");
-                }
-                else if (selectedTarget.Center != null && selectedTarget.Center.IsValid && selectedTarget.Center.DepthM > 0)
-                {
-                    nearPoint = selectedTarget.Center;
-                    nearName = "core_point";
-                    Console.WriteLine($"[NearPickTask] 选中目标 index={selectedTarget.Index}, core_point={nearPoint}");
-                }
-                else if (selectedTarget.TopCenter != null && selectedTarget.TopCenter.IsValid && selectedTarget.TopCenter.DepthM > 0)
-                {
-                    nearPoint = selectedTarget.TopCenter;
-                    nearName = "top_center";
-                    Console.WriteLine($"[NearPickTask] 选中目标 index={selectedTarget.Index}, top_center={nearPoint}");
+                    Console.WriteLine($"[NearPickTask] Python SelectedTarget 无效（selectedIndex={nearResult.SelectedIndex}），切换到本轮 Far 回退。");
                 }
                 else
                 {
-                    Console.WriteLine("[NearPickTask] 选中目标缺少有效 core_point / top_center，切换到远端回退。");
+                    nearPoint = selectedTarget.TopCenter;
+                    nearName = "top_center";
+                    Console.WriteLine($"[NearPickTask] 最终使用 Python 选中目标：selectedIndex={nearResult.SelectedIndex}, targetIndex={selectedTarget.Index}, top_center={nearPoint}");
                 }
             }
         }
@@ -336,7 +405,8 @@ public sealed class NearPickTask : IPickTask
         if (nearPoint != null)
         {
             var farReference = context?.FarResult;
-            if (IsValidFarResult(farReference))
+            var farDetectionFlangePose = context?.FarDetectionFlangePose;
+            if (IsValidFarResult(farReference) && farDetectionFlangePose.HasValue)
             {
                 var farTopCenter = farReference!.SelectedTarget!.TopCenter!;
                 bool deviated = IsNearPointDeviatedFromFarReference(
@@ -344,48 +414,40 @@ public sealed class NearPickTask : IPickTask
                     farTopCenter,
                     transformer,
                     currentFlangePose,
-                    stemOffsetM: _profile.StemOffsetAboveCorePointM,
-                    farTopCenterUpOffsetM: 0.0,
-                    thresholdM: 0.005);
+                    farDetectionFlangePose.Value,
+                    _profile.FarReferenceDeviationThresholdM);
 
                 if (!deviated)
                 {
-                    Console.WriteLine("[NearPickTask] near 采摘点与远端靠近 top_center 一致（<=0.5cm），使用近端结果。");
-                    return (nearPoint, nearName);
+                    Console.WriteLine($"[NearPickTask] near top_center 与远端靠近 top_center 一致（<={_profile.FarReferenceDeviationThresholdM * 100:F1}cm），使用近端结果。");
+                    return new PickReference(nearPoint, nearName, currentFlangePose);
                 }
 
-                Console.WriteLine("[NearPickTask] near 采摘点偏离远端靠近 top_center >0.5cm，判定 near 失效。");
+                Console.WriteLine($"[NearPickTask] near top_center 偏离远端靠近 top_center >{_profile.FarReferenceDeviationThresholdM * 100:F1}cm，判定 near 失效。");
             }
             else
             {
-                Console.WriteLine("[NearPickTask] 无远端靠近 far 参考，跳过偏差校验，使用近端结果。");
-                return (nearPoint, nearName);
+                Console.WriteLine("[NearPickTask] 无远端靠近 far Base 参考，跳过偏差校验，使用近端结果。");
+                return new PickReference(nearPoint, nearName, currentFlangePose);
             }
         }
 
-        // near 失败或偏离过大：优先新的自动 far 识别，失败后回退 context.FarResult（近端阶段不进入手动标定）
-        Console.WriteLine("[NearPickTask] near 无效或偏离，请求新的自动 far 检测...");
-        FarDetectionResult? newFarResult = await perception.CaptureFarAsync(forceManual: false, allowManualFallback: false, cancellationToken: ct);
-
-        if (IsValidFarResult(newFarResult))
+        // near 失败或偏离过大：不再请求新的 far 识别，直接使用 context 中保存的 far 结果
+        if (IsValidFarResult(context?.FarResult) && context?.FarDetectionFlangePose.HasValue == true)
         {
-            Console.WriteLine("[NearPickTask] 使用新的 far 检测结果。");
-            return (newFarResult!.SelectedTarget!.TopCenter!, "new_far_top_center");
-        }
-
-        if (IsValidFarResult(context?.FarResult))
-        {
-            Console.WriteLine("[NearPickTask] 新的自动 far 检测失败，回退使用远端靠近阶段的 far top_center。");
-            return (context!.FarResult!.SelectedTarget!.TopCenter!, "context_far_top_center");
+            Console.WriteLine("[NearPickTask] near 无效或偏离，直接使用远端靠近阶段保存的 far top_center（使用 far 检测时刻位姿转换）。");
+            return new PickReference(
+                context!.FarResult!.SelectedTarget!.TopCenter!,
+                "context_far_top_center",
+                context.FarDetectionFlangePose.Value);
         }
 
         throw new TaskAbortException("[NearPickTask] 无可用的 far 目标，无法继续近端采摘。");
     }
 
     /// <summary>
-    /// 判断 near 采摘点是否偏离 far 参考点。
-    /// 将 far 的 top_center 在 Base Z 方向向上偏移 farTopCenterUpOffsetM，
-    /// 与 near 采摘点（已考虑 StemOffsetAboveCorePointM）转换到 Base 后的位置比较。
+    /// 判断 near top_center 是否偏离 far 参考点。
+    /// near 点使用当前位姿转换到 Base；far 点必须使用 far 检测时刻的法兰位姿转换到 Base。
     /// 若距离大于 thresholdM，返回 true。
     /// </summary>
     private static bool IsNearPointDeviatedFromFarReference(
@@ -393,27 +455,23 @@ public sealed class NearPickTask : IPickTask
         ImagePoint farTopCenter,
         ICoordinateTransformer transformer,
         Pose3D currentFlangePose,
-        double stemOffsetM,
-        double farTopCenterUpOffsetM,
+        Pose3D farDetectionFlangePose,
         double thresholdM)
     {
-        var nearBase = transformer.ImagePointToBase(nearPoint, currentFlangePose, -stemOffsetM);
-        var farBase = transformer.ImagePointToBase(farTopCenter, currentFlangePose, 0.0);
+        var nearBase = transformer.ImagePointToBase(nearPoint, currentFlangePose);
+        var farBase = transformer.ImagePointToBase(farTopCenter, farDetectionFlangePose);
 
         if (nearBase == null || farBase == null)
         {
-            Console.WriteLine("[NearPickTask] 无法将 near/far 点转换到 Base，跳过偏差校验。");
-            return false;
+            throw Abort("Near/Far 偏差检查坐标转换失败，不能默认判定为未偏离。");
         }
 
-        var farReference = farBase.Value with { Z = farBase.Value.Z + farTopCenterUpOffsetM };
-
-        double dx = nearBase.Value.X - farReference.X;
-        double dy = nearBase.Value.Y - farReference.Y;
-        double dz = nearBase.Value.Z - farReference.Z;
+        double dx = nearBase.Value.X - farBase.Value.X;
+        double dy = nearBase.Value.Y - farBase.Value.Y;
+        double dz = nearBase.Value.Z - farBase.Value.Z;
         double distance = Math.Sqrt(dx * dx + dy * dy + dz * dz);
 
-        Console.WriteLine($"[NearPickTask] near_base={nearBase.Value}, far_reference={farReference}, distance={distance * 100:F2}cm");
+        Console.WriteLine($"[NearPickTask] near_base={nearBase.Value}, far_base={farBase.Value}, distance={distance * 100:F2}cm");
         return distance > thresholdM;
     }
 
@@ -434,6 +492,15 @@ public sealed class NearPickTask : IPickTask
     private static bool IsValidFarResult(FarDetectionResult? farResult)
     {
         return IsTrustedFarFallback(farResult) && HasValidTopCenter(farResult);
+    }
+
+    private static TaskAbortException Abort(string reason, Exception? innerException = null)
+    {
+        string message = $"[NearPickTask] 中止：{reason}";
+        Console.WriteLine(message);
+        return innerException == null
+            ? new TaskAbortException(message)
+            : new TaskAbortException(message, innerException);
     }
 
     /// <summary>
@@ -637,6 +704,39 @@ public sealed class NearPickTask : IPickTask
     }
 
     /// <summary>
+    /// 在 current 与 target 之间寻找一个可达中间点，使得从该中间点执行工具 XY-only 阶段后再直线 Z 阶段可达。
+    /// 从靠近 target 的位置（t 较大）向靠近 current 的位置（t 较小）搜索，优先选择离 target 更近的中间点。
+    /// 返回 null 表示未找到满足条件的中间点。
+    /// </summary>
+    private static async Task<Pose3D?> FindReachableIntermediateAsync(
+        IStagedMotionRobot staged,
+        Pose3D current,
+        Pose3D target,
+        CancellationToken ct,
+        int steps = 10)
+    {
+        for (int i = steps - 1; i >= 1; i--)
+        {
+            double t = i / (double)steps;
+            var intermediate = InterpolatePose(current, target, t);
+
+            if (!await staged.IsPoseReachableAsync(intermediate, ct))
+            {
+                continue;
+            }
+
+            var xyFromIntermediate = PoseUtils.ComputeToolXyOnlyPose(intermediate, target);
+            if (await staged.IsPoseReachableAsync(xyFromIntermediate, ct))
+            {
+                Console.WriteLine($"[NearPickTask] 找到可达中间点（t={t:F2}）：{intermediate}");
+                return intermediate;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// 在两个位姿之间做线性插值。当前近端采摘所有相关位姿姿态相同，
     /// 因此欧拉角直接插值不会产生实际姿态变化。
     /// </summary>
@@ -653,9 +753,10 @@ public sealed class NearPickTask : IPickTask
 
     /// <summary>
     /// 根据配置选择直接运动或分阶段安全运动。
-    /// 若启用 IK 预检查且目标不可达，会尝试小幅度扰动姿态寻找可达解。
+    /// 若启用 IK 预检查且目标不可达，会尝试小幅度扰动姿态寻找可达解，
+    /// 仍不可达时尝试返回 current→target 之间的可达中间点。
     /// </summary>
-    private async Task MoveToolWithProfileAsync(IRobot robot, Pose3D target, MoveOptions baseOptions, CancellationToken ct)
+    private async Task MoveToolWithProfileAsync(IRobot robot, Pose3D current, Pose3D target, MoveOptions baseOptions, CancellationToken ct)
     {
         Console.WriteLine($"[NearPickTask] 准备运动到目标：{target}");
 
@@ -667,10 +768,10 @@ public sealed class NearPickTask : IPickTask
         }
 
         Console.WriteLine("[NearPickTask] 使用分阶段安全运动。");
-        Pose3D reachableTarget = await FindReachableTargetAsync(staged, target, ct);
+        Pose3D reachableTarget = await FindReachableTargetAsync(staged, current, target, ct);
         if (reachableTarget != target)
         {
-            Console.WriteLine($"[NearPickTask] 使用姿态扰动后的可达目标：{reachableTarget}");
+            Console.WriteLine($"[NearPickTask] 使用可达替代目标：{reachableTarget}");
         }
 
         await staged.MoveToolStagedAsync(reachableTarget, baseOptions,
@@ -680,9 +781,12 @@ public sealed class NearPickTask : IPickTask
     }
 
     /// <summary>
-    /// 寻找可达目标位姿。先检查原目标，若不可达则依次尝试扰动 rx/ry/rz。
+    /// 寻找可达目标位姿。
+    /// 1. 先检查原目标；
+    /// 2. 若不可达则依次尝试扰动 rx/ry/rz；
+    /// 3. 仍不可达时，在 current 与 target 之间搜索最远的可达中间点作为替代目标。
     /// </summary>
-    private async Task<Pose3D> FindReachableTargetAsync(IStagedMotionRobot staged, Pose3D target, CancellationToken ct)
+    private async Task<Pose3D> FindReachableTargetAsync(IStagedMotionRobot staged, Pose3D current, Pose3D target, CancellationToken ct)
     {
         if (!_profile.UseIkPreCheck)
         {
@@ -726,7 +830,19 @@ public sealed class NearPickTask : IPickTask
             }
         }
 
-        throw new InvalidOperationException($"目标位姿逆解不可达，且未找到可行替代姿态：{target}");
+        Console.WriteLine("[NearPickTask] 姿态扰动均不可达，尝试寻找可达中间点...");
+        for (int i = 9; i >= 1; i--)
+        {
+            double t = i / 10.0;
+            var intermediate = InterpolatePose(current, target, t);
+            if (await staged.IsPoseReachableAsync(intermediate, ct))
+            {
+                Console.WriteLine($"[NearPickTask] 找到可达中间点作为替代目标（t={t:F2}）：{intermediate}");
+                return intermediate;
+            }
+        }
+
+        throw new InvalidOperationException($"目标位姿逆解不可达，且未找到可行替代姿态或中间点：{target}");
     }
 
     private static double[] Normalize(double[] v)

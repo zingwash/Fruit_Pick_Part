@@ -32,14 +32,17 @@ public sealed class FarApproachTask : IPickTask
     {
         if (perception == null)
         {
-            Console.WriteLine("[FarApproachTask] 未配置视觉感知，无法执行远距靠近。");
-            return;
+            throw Abort("未配置视觉感知，无法执行远距靠近。");
         }
 
         if (transformer == null)
         {
-            Console.WriteLine("[FarApproachTask] 未配置坐标转换器，无法执行远距靠近。");
-            return;
+            throw Abort("未配置坐标转换器，无法执行远距靠近。");
+        }
+
+        if (context?.StrictAutomaticMode == true && (context.ForceManual || !context.DisableManualFallback))
+        {
+            throw Abort("严格自动模式必须禁用视觉手动回退，禁止开始 Far 检测和运动。");
         }
 
         ct.ThrowIfCancellationRequested();
@@ -51,80 +54,96 @@ public sealed class FarApproachTask : IPickTask
         // 2. 请求 far bbox 检测（若 Runner 已提供结果且未强制手动，则直接复用）
         bool forceManual = context?.ForceManual ?? false;
         FarDetectionResult? farResult = (!forceManual ? context?.FarResult : null);
+        Pose3D farDetectionFlangePose;
 
         if (farResult != null)
         {
+            if (!context!.FarDetectionFlangePose.HasValue)
+            {
+                throw Abort("复用 FarResult 时缺少同一次检测的 FarDetectionFlangePose，禁止使用当前位姿代替。");
+            }
+            farDetectionFlangePose = context.FarDetectionFlangePose.Value;
             Console.WriteLine("[FarApproachTask] 使用 Runner 提供的 far 检测结果。");
         }
         else
         {
+            farDetectionFlangePose = currentFlangePose;
             Console.WriteLine("[FarApproachTask] 请求 far bbox 检测...");
-            farResult = await perception.CaptureFarAsync(forceManual: forceManual, allowManualFallback: false, cancellationToken: ct);
+            farResult = await perception.CaptureFarAsync(forceManual: forceManual, allowManualFallback: false, selectionRule: _profile.SelectionRule, selectionWeights: _profile.SelectionWeights, cancellationToken: ct);
+            Console.WriteLine($"[FarApproachTask] 自动 far 检测返回：Trusted={farResult?.Trusted}, Targets={farResult?.Targets.Count}, SelectedIndex={farResult?.SelectedIndex}");
 
             // 自动检测失败且未强制手动时，自动进入手动标定模式
-            if (!IsValidFarResult(farResult) && !forceManual)
+            // （连续采摘模式下禁用手动回退：直接判定失败并中止本轮，避免画框窗口阻塞循环）
+            if (!IsValidFarResult(farResult) && !forceManual && context?.DisableManualFallback != true)
             {
                 Console.WriteLine("[FarApproachTask] 自动 far 检测未返回可信目标，进入手动标定模式...");
-                farResult = await perception.CaptureFarAsync(forceManual: true, allowManualFallback: false, cancellationToken: ct);
+                farResult = await perception.CaptureFarAsync(forceManual: true, allowManualFallback: false, selectionRule: _profile.SelectionRule, selectionWeights: _profile.SelectionWeights, cancellationToken: ct);
             }
+        }
+
+        // 执行期间上下文不对后续阶段暴露候选结果；仅在 Far 靠近成功后重新写回。
+        if (context != null)
+        {
+            context.FarResult = null;
+            context.FarDetectionFlangePose = null;
         }
 
         if (!IsValidFarResult(farResult))
         {
-            Console.WriteLine("[FarApproachTask] far 检测无有效目标，无法继续后续任务。");
-            throw new TaskAbortException("[FarApproachTask] far 检测无有效目标，无法继续后续任务。");
-        }
-
-        // 将最终使用的 far 结果写回上下文，供后续近端采摘阶段使用
-        if (context != null)
-        {
-            context.FarResult = farResult;
+            Console.WriteLine($"[FarApproachTask] far 结果校验失败：farResult==null? {farResult == null}, Trusted={farResult?.Trusted}, SelectedTarget==null? {farResult?.SelectedTarget == null}");
+            if (farResult?.SelectedTarget != null)
+            {
+                Console.WriteLine($"[FarApproachTask] 选中目标 TopCenter={farResult.SelectedTarget.TopCenter}, IsValid={farResult.SelectedTarget.TopCenter?.IsValid}, DepthM={farResult.SelectedTarget.TopCenter?.DepthM}");
+            }
+            throw Abort("far 检测无有效目标，无法继续后续任务。");
         }
 
         var selectedTarget = farResult!.SelectedTarget!;
         if (selectedTarget.TopCenter == null || !selectedTarget.TopCenter.IsValid || selectedTarget.TopCenter.DepthM <= 0)
         {
-            Console.WriteLine("[FarApproachTask] 选中目标缺少有效 TopCenter，无法继续后续任务。");
-            throw new TaskAbortException("[FarApproachTask] 选中目标缺少有效 TopCenter，无法继续后续任务。");
+            throw Abort("选中目标缺少有效 TopCenter 或深度小于等于零，无法继续后续任务。");
         }
 
         Console.WriteLine($"[FarApproachTask] 选中目标 index={selectedTarget.Index}, TopCenter={selectedTarget.TopCenter}");
 
         // 3. TopCenter → Base
-        var topCenterBasePose = transformer.ImagePointToBase(selectedTarget.TopCenter, currentFlangePose);
+        var topCenterBasePose = transformer.ImagePointToBase(selectedTarget.TopCenter, farDetectionFlangePose);
         if (topCenterBasePose == null)
         {
-            Console.WriteLine("[FarApproachTask] TopCenter 转换到 Base 失败，跳过。");
-            return;
+            throw Abort("TopCenter 转换到 Base 失败，禁止继续 Near 阶段。");
         }
 
         var topCenterBase = topCenterBasePose.Value;
         Console.WriteLine($"[FarApproachTask] TopCenter in Base：{topCenterBase}");
 
         // 4. 计算远距靠近目标法兰位姿
-        var targetFlangePose = ComputeFarApproachFlangePose(
-            currentFlangePose,
-            topCenterBase,
-            _robotProfile.TcpOffsetZ,
-            _profile.TopCenterClearanceM,
-            _profile.ApproachReserveM,
-            _profile.MaxApproachM,
-            _profile.AlignToolZToTarget);
+        Pose3D targetFlangePose;
+        try
+        {
+            targetFlangePose = ComputeFarApproachFlangePose(
+                currentFlangePose,
+                topCenterBase,
+                _robotProfile.TcpOffsetZ,
+                _profile.TopCenterClearanceM,
+                _profile.MaxApproachM,
+                _profile.AlignToolZToTarget);
 
-        // 限制工具 Z 正方向最大前进距离
-        targetFlangePose = PoseUtils.ClampTcpAlongToolZ(
-            currentFlangePose,
-            targetFlangePose,
-            _robotProfile.TcpOffsetZ,
-            _profile.MaxToolZForwardTravelM,
-            "FarApproachTask");
-
-        // 保证 TCP 离葡萄串中心不小于最小安全距离
-        targetFlangePose = EnsureMinTcpToTargetDistance(
-            targetFlangePose,
-            topCenterBase,
-            _robotProfile.TcpOffsetZ,
-            _profile.MinTcpToTargetDistanceM);
+            // 限制工具 Z 正方向最大前进距离
+            targetFlangePose = PoseUtils.ClampTcpAlongToolZ(
+                currentFlangePose,
+                targetFlangePose,
+                _robotProfile.TcpOffsetZ,
+                _profile.MaxToolZForwardTravelM,
+                "FarApproachTask");
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw Abort("远距靠近目标位姿计算失败。", ex);
+        }
 
         Console.WriteLine($"[FarApproachTask] 远距靠近目标法兰位姿：{targetFlangePose}");
 
@@ -136,14 +155,48 @@ public sealed class FarApproachTask : IPickTask
             BlockUntilComplete = true
         };
 
-        await MoveToolWithProfileAsync(robot, currentFlangePose, targetFlangePose, moveOptions, ct);
+        try
+        {
+            await MoveToolWithProfileAsync(robot, currentFlangePose, targetFlangePose, moveOptions, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (TaskAbortException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw Abort("Far 靠近运动或必要的可达性检查失败。", ex);
+        }
         ct.ThrowIfCancellationRequested();
+
+        // 只有 Far 靠近动作真正完成后，才把本轮结果公布给后续 Near 阶段。
+        // 避免运动失败时上下文中留下看似可继续使用的 Far 结果。
+        if (context != null)
+        {
+            context.FarResult = farResult;
+            context.FarDetectionFlangePose = farDetectionFlangePose;
+        }
+
         Console.WriteLine("[FarApproachTask] 远距靠近完成。");
+    }
+
+    private static TaskAbortException Abort(string message, Exception? innerException = null)
+    {
+        string fullMessage = $"[FarApproachTask] {message}";
+        Console.WriteLine(fullMessage);
+        return innerException == null
+            ? new TaskAbortException(fullMessage)
+            : new TaskAbortException(fullMessage, innerException);
     }
 
     /// <summary>
     /// 根据配置选择直接运动或分阶段安全运动。
-    /// 若启用 IK 预检查且目标不可达，会尝试小幅度扰动姿态寻找可达解。
+    /// 若启用 IK 预检查，会先对最终目标做逆解可达性校验与姿态扰动寻优，
+    /// 避免机械臂在分阶段运动（工具 XY → 工具 Z 或位置 → 姿态）中卡死。
     /// </summary>
     private async Task MoveToolWithProfileAsync(
         IRobot robot,
@@ -154,48 +207,98 @@ public sealed class FarApproachTask : IPickTask
     {
         Console.WriteLine($"[FarApproachTask] 准备运动到目标：{target}");
 
-        if (_profile.UseStagedToolXyThenToolZ)
+        // 统一先做一次可达性检查与姿态扰动：后续无论哪种分阶段策略都使用可达目标，降低卡死风险。
+        Pose3D reachableTarget = target;
+        if (robot is IStagedMotionRobot staged)
         {
-            Console.WriteLine("[FarApproachTask] 使用工具 XY → 工具 Z 分阶段运动。");
-
-            // 阶段 1：工具 X/Y 阶段（保持当前工具 Z 不变）
-            var xyOnlyPose = PoseUtils.ComputeToolXyOnlyPose(currentFlangePose, target);
-            Console.WriteLine($"[FarApproachTask] 工具 XY 阶段：{xyOnlyPose}");
-            await robot.MoveToolAsync(xyOnlyPose, baseOptions, ct);
-            ct.ThrowIfCancellationRequested();
-
-            // 阶段 2：工具 Z 阶段（沿工具 Z 直线移动到目标）
-            Console.WriteLine($"[FarApproachTask] 工具 Z 阶段：{target}");
-            var toolZOptions = baseOptions with { MoveMode = MoveMode.Linear };
-            await robot.MoveToolAsync(target, toolZOptions, ct);
-            ct.ThrowIfCancellationRequested();
-            return;
+            reachableTarget = await FindReachableTargetAsync(staged, currentFlangePose, target, ct);
+            if (reachableTarget != target)
+            {
+                Console.WriteLine($"[FarApproachTask] 使用可达替代目标：{reachableTarget}");
+            }
         }
 
-        if (robot is not IStagedMotionRobot staged || !_profile.UseStagedPositionThenEuler)
+        if (_profile.UseStagedToolXyThenToolZ)
+        {
+            Console.WriteLine("[FarApproachTask] 尝试工具 XY → 工具 Z 分阶段运动。");
+
+            // 阶段 1a：工具 X/Y 阶段（保持当前工具 Z 不变）
+            var xyOnlyPose = PoseUtils.ComputeToolXyOnlyPose(currentFlangePose, reachableTarget);
+
+            bool xyReachable = true;
+            if (robot is IStagedMotionRobot stagedCheck && _profile.UseIkPreCheck)
+            {
+                xyReachable = await stagedCheck.IsPoseReachableAsync(xyOnlyPose, ct);
+            }
+
+            if (xyReachable)
+            {
+                Console.WriteLine($"[FarApproachTask] 工具 XY 阶段：{xyOnlyPose}");
+                await robot.MoveToolAsync(xyOnlyPose, baseOptions, ct);
+                ct.ThrowIfCancellationRequested();
+
+                // 阶段 2：工具 Z 阶段（沿工具 Z 直线移动到目标）
+                Console.WriteLine($"[FarApproachTask] 工具 Z 阶段：{reachableTarget}");
+                var toolZOptions = baseOptions with { MoveMode = MoveMode.Linear };
+                await robot.MoveToolAsync(reachableTarget, toolZOptions, ct);
+                ct.ThrowIfCancellationRequested();
+                return;
+            }
+
+            // XY 同时不可达时，fallback 到“中间点（XYZ 同时动）→ XY → Z”
+            Console.WriteLine($"[FarApproachTask] 工具 XY 阶段目标不可达，尝试先移动到可达中间点。xyOnlyPose={xyOnlyPose}");
+
+            if (robot is IStagedMotionRobot stagedIntermediate)
+            {
+                var intermediate = await FindReachableIntermediateAsync(stagedIntermediate, currentFlangePose, reachableTarget, ct);
+                if (intermediate.HasValue)
+                {
+                    var intermediatePose = intermediate.Value;
+
+                    // 阶段 1b：先 XYZ 同时移动到中间点，改变构型到更接近目标的位置
+                    Console.WriteLine($"[FarApproachTask] 中间点（XYZ 同时动）：{intermediatePose}");
+                    await robot.MoveToolAsync(intermediatePose, baseOptions, ct);
+                    ct.ThrowIfCancellationRequested();
+
+                    // 阶段 1c：从中间点执行工具 XY 阶段
+                    var xyFromIntermediate = PoseUtils.ComputeToolXyOnlyPose(intermediatePose, reachableTarget);
+                    Console.WriteLine($"[FarApproachTask] 中间点工具 XY 阶段：{xyFromIntermediate}");
+                    await robot.MoveToolAsync(xyFromIntermediate, baseOptions, ct);
+                    ct.ThrowIfCancellationRequested();
+
+                    // 阶段 2：工具 Z 阶段
+                    Console.WriteLine($"[FarApproachTask] 工具 Z 阶段：{reachableTarget}");
+                    var toolZOptions = baseOptions with { MoveMode = MoveMode.Linear };
+                    await robot.MoveToolAsync(reachableTarget, toolZOptions, ct);
+                    ct.ThrowIfCancellationRequested();
+                    return;
+                }
+            }
+
+            Console.WriteLine("[FarApproachTask] 未找到可达中间点，回退到直接运动。");
+        }
+
+        if (robot is not IStagedMotionRobot staged2 || !_profile.UseStagedPositionThenEuler)
         {
             Console.WriteLine("[FarApproachTask] 使用直接运动。");
-            await robot.MoveToolAsync(target, baseOptions, ct);
+            await robot.MoveToolAsync(reachableTarget, baseOptions, ct);
             return;
         }
 
         Console.WriteLine("[FarApproachTask] 使用分阶段安全运动。");
-        Pose3D reachableTarget = await FindReachableTargetAsync(staged, target, ct);
-        if (reachableTarget != target)
-        {
-            Console.WriteLine($"[FarApproachTask] 使用姿态扰动后的可达目标：{reachableTarget}");
-        }
-
-        await staged.MoveToolStagedAsync(reachableTarget, baseOptions,
+        await staged2.MoveToolStagedAsync(reachableTarget, baseOptions,
             _profile.StagedPositionToleranceM,
             _profile.StagedEulerToleranceRad,
             _profile.StagedMoveTimeoutMs, ct);
     }
 
     /// <summary>
-    /// 寻找可达目标位姿。先检查原目标，若不可达则依次尝试扰动 rx/ry/rz。
+    /// 寻找可达目标位姿。
+    /// 1. 先检查原目标；
+    /// 2. 若不可达则依次尝试扰动 rx/ry/rz；
+    /// 3. 仍不可达时，在 current 与 target 之间搜索最远的可达中间点作为替代目标。
     /// </summary>
-    private async Task<Pose3D> FindReachableTargetAsync(IStagedMotionRobot staged, Pose3D target, CancellationToken ct)
+    private async Task<Pose3D> FindReachableTargetAsync(IStagedMotionRobot staged, Pose3D current, Pose3D target, CancellationToken ct)
     {
         if (!_profile.UseIkPreCheck)
         {
@@ -215,31 +318,101 @@ public sealed class FarApproachTask : IPickTask
             return target;
         }
 
-        Console.WriteLine("[FarApproachTask] 原目标不可达，尝试姿态扰动...");
-        double[] deltas = [0.1, 0.2, 0.3, 0.5];
-        foreach (double delta in deltas)
+        if (_profile.AllowIkOrientationPerturbation)
         {
-            Pose3D[] trials =
-            [
-                target with { Rx = target.Rx + delta },
-                target with { Rx = target.Rx - delta },
-                target with { Ry = target.Ry + delta },
-                target with { Ry = target.Ry - delta },
-                target with { Rz = target.Rz + delta },
-                target with { Rz = target.Rz - delta },
-            ];
-
-            foreach (Pose3D trial in trials)
+            Console.WriteLine("[FarApproachTask] 原目标不可达，尝试姿态扰动...");
+            double[] deltas = [0.1, 0.2, 0.3, 0.5];
+            deltas = deltas.Where(d => d <= _profile.IkPerturbMaxDeltaRad).ToArray();
+            if (deltas.Length == 0)
             {
-                if (await staged.IsPoseReachableAsync(trial, ct))
+                throw new TaskAbortException($"[FarApproachTask] 目标位姿逆解不可达，且 IkPerturbMaxDeltaRad={_profile.IkPerturbMaxDeltaRad:F2} 下无可用扰动量，任务终止：{target}");
+            }
+
+            foreach (double delta in deltas)
+            {
+                Pose3D[] trials =
+                [
+                    target with { Rx = target.Rx + delta },
+                    target with { Rx = target.Rx - delta },
+                    target with { Ry = target.Ry + delta },
+                    target with { Ry = target.Ry - delta },
+                    target with { Rz = target.Rz + delta },
+                    target with { Rz = target.Rz - delta },
+                ];
+
+                foreach (Pose3D trial in trials)
                 {
-                    Console.WriteLine($"[FarApproachTask] 找到可达替代姿态（delta={delta:F2}）：{trial}");
-                    return trial;
+                    if (await staged.IsPoseReachableAsync(trial, ct))
+                    {
+                        Console.WriteLine($"[FarApproachTask] 找到可达替代姿态（delta={delta:F2}）：{trial}");
+                        return trial;
+                    }
                 }
             }
         }
+        else
+        {
+            Console.WriteLine("[FarApproachTask] 原目标不可达，已禁用姿态扰动，尝试姿态不变的中间点搜索...");
+        }
 
-        throw new InvalidOperationException($"目标位姿逆解不可达，且未找到可行替代姿态：{target}");
+        // 中间点搜索：在 current 与 target 之间插值。target 姿态=当前姿态时插值姿态不变，因此该兜底不修改末端姿态。
+        Console.WriteLine("[FarApproachTask] 尝试寻找可达中间点（姿态不变）...");
+        for (int i = 9; i >= 1; i--)
+        {
+            double t = i / 10.0;
+            var intermediate = InterpolatePose(current, target, t);
+            if (await staged.IsPoseReachableAsync(intermediate, ct))
+            {
+                Console.WriteLine($"[FarApproachTask] 找到可达中间点作为替代目标（t={t:F2}）：{intermediate}");
+                return intermediate;
+            }
+        }
+
+        throw new TaskAbortException($"[FarApproachTask] 目标位姿逆解不可达，且未找到可行替代位姿，任务终止：{target}");
+    }
+
+    /// <summary>
+    /// 在 current 与 target 之间寻找一个可达中间点，使得从该中间点执行工具 XY-only 阶段后再直线 Z 阶段可达。
+    /// 从靠近 target 的位置（t 较大）向靠近 current 的位置（t 较小）搜索，优先选择离 target 更近的中间点。
+    /// 返回 null 表示未找到满足条件的中间点。
+    /// </summary>
+    private static async Task<Pose3D?> FindReachableIntermediateAsync(
+        IStagedMotionRobot staged,
+        Pose3D current,
+        Pose3D target,
+        CancellationToken ct,
+        int steps = 10)
+    {
+        for (int i = steps - 1; i >= 1; i--)
+        {
+            double t = i / (double)steps;
+            var intermediate = InterpolatePose(current, target, t);
+
+            if (!await staged.IsPoseReachableAsync(intermediate, ct))
+            {
+                continue;
+            }
+
+            var xyFromIntermediate = PoseUtils.ComputeToolXyOnlyPose(intermediate, target);
+            if (await staged.IsPoseReachableAsync(xyFromIntermediate, ct))
+            {
+                Console.WriteLine($"[FarApproachTask] 找到可达中间点（t={t:F2}）：{intermediate}");
+                return intermediate;
+            }
+        }
+
+        return null;
+    }
+
+    private static Pose3D InterpolatePose(Pose3D a, Pose3D b, double t)
+    {
+        return new Pose3D(
+            a.X + (b.X - a.X) * t,
+            a.Y + (b.Y - a.Y) * t,
+            a.Z + (b.Z - a.Z) * t,
+            a.Rx + (b.Rx - a.Rx) * t,
+            a.Ry + (b.Ry - a.Ry) * t,
+            a.Rz + (b.Rz - a.Rz) * t);
     }
 
     private static bool IsValidFarResult(FarDetectionResult? farResult)
@@ -250,81 +423,18 @@ public sealed class FarApproachTask : IPickTask
     }
 
     /// <summary>
-    /// 确保目标法兰位姿对应的 TCP 离目标点（葡萄串中心）不小于最小安全距离。
-    /// 若小于，则沿 TCP 指向目标点的方向回退到该距离（姿态保持不变）。
-    /// </summary>
-    private static Pose3D EnsureMinTcpToTargetDistance(
-        Pose3D targetFlangePose,
-        Pose3D targetPointBase,
-        double tcpOffsetZ,
-        double minDistanceM)
-    {
-        if (minDistanceM <= 0)
-        {
-            return targetFlangePose;
-        }
-
-        var tBaseFlange = Transform3D.FromEulerZyx(
-            targetFlangePose.X, targetFlangePose.Y, targetFlangePose.Z,
-            targetFlangePose.Rx, targetFlangePose.Ry, targetFlangePose.Rz);
-
-        double[] toolZ = [tBaseFlange[0, 2], tBaseFlange[1, 2], tBaseFlange[2, 2]];
-        double[] tcpPos =
-        [
-            targetFlangePose.X + toolZ[0] * tcpOffsetZ,
-            targetFlangePose.Y + toolZ[1] * tcpOffsetZ,
-            targetFlangePose.Z + toolZ[2] * tcpOffsetZ
-        ];
-
-        double dx = targetPointBase.X - tcpPos[0];
-        double dy = targetPointBase.Y - tcpPos[1];
-        double dz = targetPointBase.Z - tcpPos[2];
-        double distance = Math.Sqrt(dx * dx + dy * dy + dz * dz);
-
-        if (distance >= minDistanceM)
-        {
-            return targetFlangePose;
-        }
-
-        double shortage = minDistanceM - distance;
-        double[] dirToTarget = Normalize([dx, dy, dz]);
-
-        double[] newTcpPos =
-        [
-            tcpPos[0] - dirToTarget[0] * shortage,
-            tcpPos[1] - dirToTarget[1] * shortage,
-            tcpPos[2] - dirToTarget[2] * shortage
-        ];
-
-        double[] newFlangePos =
-        [
-            newTcpPos[0] - toolZ[0] * tcpOffsetZ,
-            newTcpPos[1] - toolZ[1] * tcpOffsetZ,
-            newTcpPos[2] - toolZ[2] * tcpOffsetZ
-        ];
-
-        Console.WriteLine($"[FarApproachTask] TCP 离目标点 {distance:F3}m，小于最小距离 {minDistanceM:F3}m，已回退到 {minDistanceM:F3}m。");
-
-        return targetFlangePose with
-        {
-            X = newFlangePos[0],
-            Y = newFlangePos[1],
-            Z = newFlangePos[2]
-        };
-    }
-
-    /// <summary>
     /// 计算远距靠近的目标法兰位姿。
-    /// 当 alignToolZToTarget=true 时，工具 Z 轴会正对 TopCenter（从法兰指向葡萄串）。
-    /// TCP 位于 TopCenter 上方 TopCenterClearanceM，法兰再沿工具 Z 反方向退 TcpOffsetZ。
-    /// 最终从当前法兰朝目标法兰移动，停在预留距离处。
+    /// alignToolZToTarget=false（默认）：基座轴留距——TCP 目标 = TopCenter 在基座 X 方向退 topCenterClearanceM，
+    /// Y/Z 与 TopCenter 对齐；目标法兰 = TCP 目标 − TcpOffsetZ × 工具Z（当前姿态），对任意姿态均精确成立。
+    /// alignToolZToTarget=true：工具 Z 轴正对 TopCenter（从法兰指向葡萄串），
+    /// 法兰沿“当前法兰→TopCenter”连线后退 TcpOffsetZ + topCenterClearanceM，TCP 落在连线上离 TopCenter clearance 处。
+    /// 最终从当前法兰朝目标法兰移动，单次最大移动 maxApproachM。
     /// </summary>
     private static Pose3D ComputeFarApproachFlangePose(
         Pose3D currentFlangePose,
         Pose3D topCenterBase,
         double tcpOffsetZ,
         double topCenterClearanceM,
-        double reserveDistanceM,
         double maxApproachM,
         bool alignToolZToTarget)
     {
@@ -339,24 +449,47 @@ public sealed class FarApproachTask : IPickTask
             currentFlangePose.Ry,
             currentFlangePose.Rz);
 
-        // 从当前法兰指向 TopCenter 的方向，作为正对葡萄串的接近方向
-        double[] approachDir = Normalize(
-        [
-            topCenterBase.X - currentFlangePos[0],
-            topCenterBase.Y - currentFlangePos[1],
-            topCenterBase.Z - currentFlangePos[2]
-        ]);
+        double[] targetFlangePos;
+        if (alignToolZToTarget)
+        {
+            // 从当前法兰指向 TopCenter 的方向，作为正对葡萄串的接近方向
+            double[] approachDir = Normalize(
+            [
+                topCenterBase.X - currentFlangePos[0],
+                topCenterBase.Y - currentFlangePos[1],
+                topCenterBase.Z - currentFlangePos[2]
+            ]);
 
-        double totalOffset = tcpOffsetZ + topCenterClearanceM;
+            double totalOffset = tcpOffsetZ + topCenterClearanceM;
 
-        // 目标法兰：TopCenter 沿接近方向反方向退 totalOffset
-        // 这样工具 Z 指向 TopCenter 时，TCP 刚好在 TopCenter 上方 clearance 处
-        double[] targetFlangePos =
-        [
-            topCenterBase.X - approachDir[0] * totalOffset,
-            topCenterBase.Y - approachDir[1] * totalOffset,
-            topCenterBase.Z - approachDir[2] * totalOffset
-        ];
+            // 目标法兰：TopCenter 沿接近方向反方向退 totalOffset
+            // 这样工具 Z 指向 TopCenter 时，TCP 刚好在 TopCenter 上方 clearance 处
+            targetFlangePos =
+            [
+                topCenterBase.X - approachDir[0] * totalOffset,
+                topCenterBase.Y - approachDir[1] * totalOffset,
+                topCenterBase.Z - approachDir[2] * totalOffset
+            ];
+        }
+        else
+        {
+            // 基座轴留距：TCP 目标 = TopCenter 沿基座 X 反方向退 clearance，Y/Z 与 TopCenter 对齐
+            double[] toolZ = [tBaseFlange[0, 2], tBaseFlange[1, 2], tBaseFlange[2, 2]];
+            double[] targetTcpPos =
+            [
+                topCenterBase.X - topCenterClearanceM,
+                topCenterBase.Y,
+                topCenterBase.Z
+            ];
+
+            // 目标法兰 = TCP 目标 − TcpOffsetZ × 工具Z，保证 TCP 精确落在 targetTcpPos
+            targetFlangePos =
+            [
+                targetTcpPos[0] - toolZ[0] * tcpOffsetZ,
+                targetTcpPos[1] - toolZ[1] * tcpOffsetZ,
+                targetTcpPos[2] - toolZ[2] * tcpOffsetZ
+            ];
+        }
 
         double[] delta =
         [
@@ -371,17 +504,17 @@ public sealed class FarApproachTask : IPickTask
             throw new InvalidOperationException("目标法兰位置与当前法兰位置重合，无法计算靠近方向。");
         }
 
-        // 预留 reserveDistanceM，并限制单次最大靠近距离
-        double moveDistance = Math.Max(0.0, distance - reserveDistanceM);
-        moveDistance = Math.Min(moveDistance, maxApproachM);
+        // 限制单次最大靠近距离
+        double moveDistance = Math.Min(distance, maxApproachM);
 
-        Console.WriteLine($"[FarApproachTask] 目标法兰距离={distance:F4}m, 预留={reserveDistanceM:F4}m, 本次移动={moveDistance:F4}m");
+        Console.WriteLine($"[FarApproachTask] 目标法兰距离={distance:F4}m, 本次移动={moveDistance:F4}m");
 
+        double[] moveDir = [delta[0] / distance, delta[1] / distance, delta[2] / distance];
         double[] farFlangePos =
         [
-            currentFlangePos[0] + approachDir[0] * moveDistance,
-            currentFlangePos[1] + approachDir[1] * moveDistance,
-            currentFlangePos[2] + approachDir[2] * moveDistance
+            currentFlangePos[0] + moveDir[0] * moveDistance,
+            currentFlangePos[1] + moveDir[1] * moveDistance,
+            currentFlangePos[2] + moveDir[2] * moveDistance
         ];
 
         // 计算目标姿态

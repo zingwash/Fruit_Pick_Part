@@ -5,23 +5,28 @@ namespace FruitPickPart.Configuration;
 /// </summary>
 public sealed class FarApproachProfile
 {
+    /// <summary>远端目标选择规则。可选：nearest_center_z、nearest_image_center、nearest_comprehensive、max_confidence、lowest_top_edge（原始图像中越靠下）、highest_top_edge（原始图像中越靠上）、largest_nearest_lowest_top。</summary>
+    public string SelectionRule { get; set; } = "largest_nearest_lowest_top";
+
+    /// <summary>
+    /// largest_nearest_lowest_top 规则的权重配置。默认面积 0.3、距离 0.2、上边框靠上 0.5。
+    /// 上边框靠上指原始图像中 top_center_uv.v 越小越靠上；相机倒置 180° 时，图像上方对应物理空间下方。
+    /// 仅在 SelectionRule 为 largest_nearest_lowest_top 时生效。
+    /// </summary>
+    public SelectionWeights SelectionWeights { get; set; } = new();
+
     /// <summary>Profile 名称。</summary>
     public string Name { get; set; } = "FarApproach";
 
     /// <summary>靠近速度（百分比，由具体机械臂实现解释）。</summary>
     public double ApproachSpeed { get; set; } = 10;
 
-    /// <summary>在目标前预留的安全距离（米）。0 表示 far 靠近直接停在 TopCenterClearanceM 处。</summary>
-    public double ApproachReserveM { get; set; } = 0.0;
-
     /// <summary>
-    /// TCP 与葡萄串中心（far top_center）的最小距离（米）。
-    /// 计算出的目标位姿若使 TCP 离目标点小于此值，会沿远离目标方向回退到该距离。
+    /// 远端靠近后 TCP 离葡萄串顶部中心（top_center）的间隙（米）。
+    /// 该值即为“机械臂末端距离葡萄串”的距离，建议配置为 0.10（10cm）。
+    /// 该参数已暴露到配置文件，可根据实际场景调整。
     /// </summary>
-    public double MinTcpToTargetDistanceM { get; set; } = 0.05;
-
-    /// <summary>TCP 在 TopCenter 前方（靠近方向）的间隙（米）。与 ApproachReserveM 共同决定 far 靠近后 TCP 离葡萄串的距离。</summary>
-    public double TopCenterClearanceM { get; set; } = 0.05;
+    public double TopCenterClearanceM { get; set; } = 0.10;
 
     /// <summary>单次最大允许靠近距离（米）。</summary>
     public double MaxApproachM { get; set; } = 0.60;
@@ -61,4 +66,16 @@ public sealed class FarApproachProfile
 
     /// <summary>IK 预检查失败时是否仍允许运动（默认禁止）。</summary>
     public bool AllowMotionDespiteIkFailure { get; set; } = false;
+
+    /// <summary>
+    /// IK 预检查原目标不可达时，是否允许扰动姿态（Rx/Ry/Rz）寻找可达替代位姿。
+    /// false 时直接终止任务（TaskAbortException），保证末端姿态不被修改。
+    /// </summary>
+    public bool AllowIkOrientationPerturbation { get; set; } = true;
+
+    /// <summary>
+    /// 姿态扰动的最大幅度（弧度）。候选扰动量为 0.1/0.2/0.3/0.5 rad 中不超过此值的部分。
+    /// 仅在 AllowIkOrientationPerturbation=true 时生效。
+    /// </summary>
+    public double IkPerturbMaxDeltaRad { get; set; } = 0.5;
 }

@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>
+    <!-- 必须与 RM_Base.dll (x86 原生库) 保持一致 -->
+    <PlatformTarget>x86</PlatformTarget>
+    <Platforms>x86</Platforms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>TeachPendant</RootNamespace>
+    <AssemblyName>TeachPendant</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 复用 FruitPickPart 中的 Rm65Robot / ArmAPI / RobotProfile 等；
+         主工程里的 RM_Base.dll 和 appsettings.json 会随引用自动复制到本输出目录 -->
+    <ProjectReference Include="..\FruitPickPart.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="HelixToolkit.Core.Wpf" Version="2.27.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="Assets\RM65-B-V\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>

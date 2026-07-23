@@ -20,11 +20,14 @@ public sealed class ArmTestRunner
     private readonly ICoordinateTransformer? _transformer;
     private readonly IPickTask? _pickTask;
     private readonly IPickTask? _farApproachTask;
+    private readonly FarApproachProfile? _farApproachProfile;
     private readonly IPickTask? _nearPickTask;
+    private readonly NearPickProfile? _nearPickProfile;
     private readonly IPickTask? _placeTask;
     private readonly RobotProfile _profile;
-    private FarDetectionResult? _lastFarResult;
+    private (FarDetectionResult Result, Pose3D FlangePose)? _lastFarCapture;
     private readonly JoystickInputReader _joystick = new();
+    private readonly KeyboardInputReader _keyboard = new();
 
     private Controller? _controller;
     private bool _exitRequested;
@@ -41,7 +44,14 @@ public sealed class ArmTestRunner
     private CancellationTokenSource? _continuousNearDetectionCts;
     private Task? _continuousNearDetectionTask;
 
-    public ArmTestRunner(IRobot robot, RobotProfile profile, IGripper? gripper = null, IPerception? perception = null, ICoordinateTransformer? transformer = null, IPickTask? pickTask = null, IPickTask? farApproachTask = null, IPickTask? nearPickTask = null, IPickTask? placeTask = null)
+    // 连续采摘：后台循环执行 Home → Far → Near → Place，直到再次按空格 / 手柄 A 停止
+    private CancellationTokenSource? _continuousPickingCts;
+    private Task? _continuousPickingTask;
+
+    /// <summary>连续采摘是否正在进行中（后台任务未结束即视为进行中）。</summary>
+    private bool IsContinuousPickingActive => _continuousPickingTask is { IsCompleted: false };
+
+    public ArmTestRunner(IRobot robot, RobotProfile profile, IGripper? gripper = null, IPerception? perception = null, ICoordinateTransformer? transformer = null, IPickTask? pickTask = null, IPickTask? farApproachTask = null, FarApproachProfile? farApproachProfile = null, IPickTask? nearPickTask = null, NearPickProfile? nearPickProfile = null, IPickTask? placeTask = null)
     {
         _robot = robot ?? throw new ArgumentNullException(nameof(robot));
         _profile = profile ?? throw new ArgumentNullException(nameof(profile));
@@ -50,7 +60,9 @@ public sealed class ArmTestRunner
         _transformer = transformer;
         _pickTask = pickTask;
         _farApproachTask = farApproachTask;
+        _farApproachProfile = farApproachProfile;
         _nearPickTask = nearPickTask;
+        _nearPickProfile = nearPickProfile;
         _placeTask = placeTask;
     }
 
@@ -104,7 +116,7 @@ public sealed class ArmTestRunner
 
             Console.WriteLine("手柄已连接。");
 
-            // 启动后台急停监听，确保运动中按 B 也能立即停止机械臂
+            // 启动后台急停监听，确保运动中按 B（键盘或手柄）也能立即停止机械臂
             // 监听任务使用全局 ct，急停后只取消 _emergencyStopCts，监听任务继续运行
             _emergencyStopCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             _emergencyStopTask = Task.Run(() => EmergencyStopMonitorLoopAsync(ct));
@@ -131,10 +143,11 @@ public sealed class ArmTestRunner
             Console.WriteLine("    A - 执行一次远距靠近任务：先检测，按 Enter 执行，其他键手动标定");
             Console.WriteLine("    S - 执行一次近端采摘任务：先检测，按 Enter 执行，其他键使用远端回退");
             Console.WriteLine("    D - 执行一次放置任务：把葡萄放入框中，然后回 Home");
-            Console.WriteLine("    Space / 手柄 A - 执行一次完整循环：Home → Far → Near → Place");
+            Console.WriteLine("    Space / 手柄 A - 开始连续采摘（再次按下停止）：循环执行 Home → Far → Near → Place");
             Console.WriteLine("  [其他]");
-            Console.WriteLine("    Y - 复位到 Home 位置");
-            Console.WriteLine("    B - 急停");
+            Console.WriteLine("    Y / 手柄 Y - 复位到 Home 位置");
+            Console.WriteLine("    H / 手柄 Back - 松开夹爪并复位到 Home（安全复位）");
+            Console.WriteLine("    B / 手柄 B - 急停（运动中有效）");
             Console.WriteLine("    Q - 退出程序");
 
             while (!ct.IsCancellationRequested && !_exitRequested)
@@ -157,7 +170,21 @@ public sealed class ArmTestRunner
                         break;
                     }
 
-                    if (key == ConsoleKey.F)
+                    if (key == ConsoleKey.Spacebar)
+                    {
+                        await ToggleContinuousPickingAsync(motionCt);
+                    }
+                    else if (key == ConsoleKey.B)
+                    {
+                        // 键盘 B 由后台急停监听统一处理（运动中也能生效），这里仅消费按键，
+                        // 避免落入下面的连续采摘锁定提示
+                    }
+                    else if (IsContinuousPickingActive)
+                    {
+                        // 连续采摘期间锁定其他按键，避免与后台采摘任务并发操作机械臂/夹爪
+                        Console.WriteLine("[连续采摘] 正在进行中，其他按键已锁定；按空格停止，按 Q 退出。");
+                    }
+                    else if (key == ConsoleKey.F)
                     {
                         await TestFarDetectionAsync(motionCt);
                     }
@@ -189,9 +216,14 @@ public sealed class ArmTestRunner
                     {
                         await RunPlaceTaskAsync(motionCt);
                     }
-                    else if (key == ConsoleKey.Spacebar)
+                    else if (key == ConsoleKey.Y)
                     {
-                        await RunFullPickLoopAsync(motionCt);
+                        Console.WriteLine("[Y] 复位到 Home");
+                        await _robot.MoveJointsAsync(GetValidatedHomeJoints(), new MoveOptions { Speed = 15 }, ct);
+                    }
+                    else if (key == ConsoleKey.H)
+                    {
+                        await ResetToHomeAsync(ct);
                     }
                 }
 
@@ -206,46 +238,55 @@ public sealed class ArmTestRunner
                 bool aPressed = pressed.HasFlag(GamepadButtonFlags.A);
                 if (aPressed && !_previousAPressed)
                 {
-                    await RunFullPickLoopAsync(motionCt);
+                    await ToggleContinuousPickingAsync(motionCt);
                 }
                 _previousAPressed = aPressed;
 
-                if (pressed.HasFlag(GamepadButtonFlags.Y))
+                // 连续采摘期间锁定手柄其他操作（B 急停和 A 停止除外）
+                if (!IsContinuousPickingActive)
                 {
-                    Console.WriteLine("[Y] 复位到 Home");
-                    await _robot.MoveJointsAsync(_profile.HomeJoints, new MoveOptions { Speed = 15 }, ct);
-                }
+                    if (pressed.HasFlag(GamepadButtonFlags.Y))
+                    {
+                        Console.WriteLine("[Y] 复位到 Home");
+                        await _robot.MoveJointsAsync(GetValidatedHomeJoints(), new MoveOptions { Speed = 15 }, ct);
+                    }
 
-                if (pressed.HasFlag(GamepadButtonFlags.LeftShoulder))
-                {
-                    Console.WriteLine("[LB] 打开夹爪");
-                    if (_gripper != null)
+                    if (pressed.HasFlag(GamepadButtonFlags.Back))
                     {
-                        await _gripper.OpenAsync(cancellationToken: ct);
+                        await ResetToHomeAsync(ct);
                     }
-                    else
-                    {
-                        Console.WriteLine("  [Warning] 未配置夹爪。");
-                    }
-                }
 
-                if (pressed.HasFlag(GamepadButtonFlags.RightShoulder))
-                {
-                    Console.WriteLine("[RB] 关闭夹爪");
-                    if (_gripper != null)
+                    if (pressed.HasFlag(GamepadButtonFlags.LeftShoulder))
                     {
-                        await _gripper.CloseAsync(cancellationToken: ct);
+                        Console.WriteLine("[LB] 打开夹爪");
+                        if (_gripper != null)
+                        {
+                            await _gripper.OpenAsync(cancellationToken: ct);
+                        }
+                        else
+                        {
+                            Console.WriteLine("  [Warning] 未配置夹爪。");
+                        }
                     }
-                    else
-                    {
-                        Console.WriteLine("  [Warning] 未配置夹爪。");
-                    }
-                }
 
-                // 右扳机完全按下（XInput 范围 0..255）时进入遥控模式
-                if (state.RightTrigger > 240)
-                {
-                    await HandleRemoteMoveAsync(state, ct);
+                    if (pressed.HasFlag(GamepadButtonFlags.RightShoulder))
+                    {
+                        Console.WriteLine("[RB] 关闭夹爪");
+                        if (_gripper != null)
+                        {
+                            await _gripper.CloseAsync(cancellationToken: ct);
+                        }
+                        else
+                        {
+                            Console.WriteLine("  [Warning] 未配置夹爪。");
+                        }
+                    }
+
+                    // 右扳机完全按下（XInput 范围 0..255）时进入遥控模式
+                    if (state.RightTrigger > 240)
+                    {
+                        await HandleRemoteMoveAsync(state, ct);
+                    }
                 }
 
                 await Task.Delay(60, ct);
@@ -296,6 +337,21 @@ public sealed class ArmTestRunner
                 _continuousNearDetectionCts.Dispose();
             }
 
+            if (_continuousPickingCts != null)
+            {
+                _continuousPickingCts.Cancel();
+                // 中断可能正在进行的阻塞式运动，让后台采摘任务尽快退出
+                try
+                {
+                    await _robot.StopAsync(CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[连续采摘] 退出时调用 StopAsync 失败：{ex.Message}");
+                }
+                await CleanupContinuousPickingAsync();
+            }
+
             if (_emergencyStopCts != null)
             {
                 _emergencyStopCts.Cancel();
@@ -331,6 +387,8 @@ public sealed class ArmTestRunner
         var result = await _perception.CaptureFarAsync(
             forceManual: false,
             allowManualFallback: false,
+            selectionRule: _farApproachProfile?.SelectionRule,
+            selectionWeights: _farApproachProfile?.SelectionWeights,
             cancellationToken: ct);
         if (result == null)
         {
@@ -355,10 +413,12 @@ public sealed class ArmTestRunner
             return;
         }
 
-        Console.WriteLine("[N] 请求 near pose line 检测...");
+        Console.WriteLine("[N] 请求 near bbox 检测...");
         var result = await _perception.CaptureNearAsync(
             forceManual: false,
             allowManualFallback: false,
+            selectionRule: _nearPickProfile?.SelectionRule,
+            selectionWeights: _nearPickProfile?.SelectionWeights,
             cancellationToken: ct);
         if (result == null)
         {
@@ -369,9 +429,8 @@ public sealed class ArmTestRunner
         Console.WriteLine($"  trusted={result.Trusted}, count={result.TrustedCount}");
         if (result.SelectedTarget != null)
         {
-            Console.WriteLine($"  selected center: {result.SelectedTarget.Center}");
-            Console.WriteLine($"  keypoints: {result.SelectedTarget.Keypoints.Count}");
-            await PrintBaseCoordinatesAsync(result.SelectedTarget.Center, "center", ct);
+            Console.WriteLine($"  selected top_center: {result.SelectedTarget.TopCenter}");
+            await PrintBaseCoordinatesAsync(result.SelectedTarget.TopCenter, "top_center", ct);
         }
     }
 
@@ -434,6 +493,8 @@ public sealed class ArmTestRunner
             var result = await _perception.CaptureFarAsync(
                 forceManual: false,
                 allowManualFallback: false,
+                selectionRule: _farApproachProfile?.SelectionRule,
+                selectionWeights: _farApproachProfile?.SelectionWeights,
                 ct);
             bool detected = result != null && result.Trusted && result.SelectedTarget != null;
 
@@ -447,6 +508,8 @@ public sealed class ArmTestRunner
                     resultToUse = await _perception.CaptureFarAsync(
                         forceManual: true,
                         allowManualFallback: false,
+                        selectionRule: _farApproachProfile?.SelectionRule,
+                        selectionWeights: _farApproachProfile?.SelectionWeights,
                         ct);
                 }
             }
@@ -456,14 +519,18 @@ public sealed class ArmTestRunner
                 resultToUse = await _perception.CaptureFarAsync(
                     forceManual: true,
                     allowManualFallback: false,
+                    selectionRule: _farApproachProfile?.SelectionRule,
+                    selectionWeights: _farApproachProfile?.SelectionWeights,
                     ct);
             }
 
-            // 保存最近一次有效的 far 结果（自动或手动），供后续近端采摘回退使用
+            Pose3D? farCapturePose = null;
+            // 保存最近一次有效的 far 结果（自动或手动）及其检测位姿，供后续近端采摘回退使用
             if (resultToUse != null && resultToUse.Trusted && resultToUse.SelectedTarget != null)
             {
-                _lastFarResult = resultToUse;
-                Console.WriteLine("[A] 已保存 far 结果供后续近端采摘回退使用。");
+                farCapturePose = await _robot.GetToolPoseAsync(ct);
+                _lastFarCapture = (resultToUse, farCapturePose.Value);
+                Console.WriteLine("[A] 已保存 far 结果及检测位姿供后续近端采摘回退使用。");
             }
 
             if (resultToUse == null || !resultToUse.Trusted || resultToUse.SelectedTarget == null)
@@ -477,7 +544,8 @@ public sealed class ArmTestRunner
                 new PickTaskContext
                 {
                     ForceManual = false,
-                    FarResult = resultToUse
+                    FarResult = resultToUse,
+                    FarDetectionFlangePose = farCapturePose
                 });
             Console.WriteLine($"[A] 任务完成：{_farApproachTask.Name}");
         }
@@ -515,6 +583,8 @@ public sealed class ArmTestRunner
             var nearResult = await _perception.CaptureNearAsync(
                 forceManual: false,
                 allowManualFallback: false,
+                selectionRule: _nearPickProfile?.SelectionRule,
+                selectionWeights: _nearPickProfile?.SelectionWeights,
                 ct);
             bool nearDetected = nearResult != null && nearResult.Trusted && nearResult.SelectedTarget != null;
 
@@ -530,6 +600,7 @@ public sealed class ArmTestRunner
             }
 
             FarDetectionResult? farResult = null;
+            Pose3D? farDetectionFlangePose = null;
             if (useFarFallback)
             {
                 // 远端回退优先做一次新的 far bbox 检测
@@ -537,22 +608,24 @@ public sealed class ArmTestRunner
                 farResult = await _perception.CaptureFarAsync(
                     forceManual: false,
                     allowManualFallback: false,
+                    selectionRule: _farApproachProfile?.SelectionRule,
+                    selectionWeights: _farApproachProfile?.SelectionWeights,
                     ct);
 
-                // 新检测失败时，复用上一次远端靠近阶段保存的 far 结果
-                if (farResult == null || !farResult.Trusted || farResult.SelectedTarget == null)
+                if (farResult != null && farResult.Trusted && farResult.SelectedTarget != null)
                 {
-                    bool hasLastFarResult = _lastFarResult != null
-                        && _lastFarResult.Trusted
-                        && _lastFarResult.SelectedTarget != null
-                        && _lastFarResult.SelectedTarget.TopCenter != null
-                        && _lastFarResult.SelectedTarget.TopCenter.IsValid
-                        && _lastFarResult.SelectedTarget.TopCenter.DepthM > 0;
-
-                    if (hasLastFarResult)
+                    // 新 far 检测有效，记录当前位姿作为 far 图像点的转换位姿
+                    farDetectionFlangePose = await _robot.GetToolPoseAsync(ct);
+                }
+                else
+                {
+                    // 新检测失败时，复用上一次远端靠近阶段保存的 far 结果及其检测位姿
+                    if (_lastFarCapture.HasValue
+                        && IsValidFarResult(_lastFarCapture.Value.Result))
                     {
                         Console.WriteLine("[S] 新 far 检测失败，复用上一次远端靠近阶段保存的 far top_center 作为回退。");
-                        farResult = _lastFarResult;
+                        farResult = _lastFarCapture.Value.Result;
+                        farDetectionFlangePose = _lastFarCapture.Value.FlangePose;
                     }
                     else
                     {
@@ -569,6 +642,7 @@ public sealed class ArmTestRunner
                     ForceManual = false,
                     NearResult = useFarFallback ? null : nearResult,
                     FarResult = farResult,
+                    FarDetectionFlangePose = farDetectionFlangePose,
                     UseFarFallback = useFarFallback
                 });
             Console.WriteLine($"[S] 任务完成：{_nearPickTask.Name}");
@@ -581,6 +655,15 @@ public sealed class ArmTestRunner
         {
             Console.WriteLine($"[S] 任务执行出错：{ex.Message}");
         }
+    }
+
+    private static bool IsValidFarResult(FarDetectionResult farResult)
+    {
+        return farResult.Trusted
+            && farResult.SelectedTarget != null
+            && farResult.SelectedTarget.TopCenter != null
+            && farResult.SelectedTarget.TopCenter.IsValid
+            && farResult.SelectedTarget.TopCenter.DepthM > 0;
     }
 
     private async Task RunPlaceTaskAsync(CancellationToken ct)
@@ -608,10 +691,43 @@ public sealed class ArmTestRunner
     }
 
     /// <summary>
-    /// 执行一次完整采摘循环：Home → 远端靠近 → 近端采摘 → 放置到框。
-    /// 由键盘空格键或手柄 A 键触发。
+    /// 安全复位：先松开夹爪，再回 Home 位置。
+    /// 用于采摘异常、夹爪卡葡萄或需要紧急撤离的场景。
     /// </summary>
-    private async Task RunFullPickLoopAsync(CancellationToken ct)
+    private async Task ResetToHomeAsync(CancellationToken ct)
+    {
+        try
+        {
+            Console.WriteLine("[复位] 松开夹爪...");
+            if (_gripper != null)
+            {
+                await _gripper.OpenAsync(cancellationToken: ct);
+            }
+            else
+            {
+                Console.WriteLine("  [Warning] 未配置夹爪，跳过松开。");
+            }
+
+            Console.WriteLine("[复位] 回到 Home...");
+            await _robot.MoveJointsAsync(GetValidatedHomeJoints(), new MoveOptions { Speed = 15 }, ct);
+            Console.WriteLine("[复位] 已回到 Home，夹爪已松开。");
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("[复位] 操作已取消。");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[复位] 出错：{ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 执行一次完整采摘循环：Home → 远端靠近 → 近端采摘 → 放置到框。
+    /// 返回 true 表示本轮完整完成；返回 false 表示中止（无有效目标）或出错。
+    /// disableManualFallback=true 时（连续采摘模式），检测失败直接中止本轮而不进入手动画框标定。
+    /// </summary>
+    private async Task<bool> RunFullPickLoopAsync(CancellationToken ct, bool disableManualFallback = false)
     {
         Console.WriteLine("[循环] 开始完整采摘流程：Home → Far → Near → Place");
 
@@ -619,12 +735,15 @@ public sealed class ArmTestRunner
         {
             // 1. 复位到 Home
             Console.WriteLine("[循环] 复位到 Home...");
-            await _robot.MoveJointsAsync(_profile.HomeJoints, new MoveOptions { Speed = 15 }, ct);
+            await _robot.MoveJointsAsync(GetValidatedHomeJoints(), new MoveOptions { Speed = 15 }, ct);
             ct.ThrowIfCancellationRequested();
             Console.WriteLine("[循环] 已到达 Home。");
 
             // 循环上下文：用于在远距靠近和近端采摘之间传递 far 结果
-            var loopContext = new PickTaskContext();
+            var loopContext = new PickTaskContext
+            {
+                DisableManualFallback = disableManualFallback
+            };
 
             // 2. 远端靠近
             if (_farApproachTask == null)
@@ -666,18 +785,117 @@ public sealed class ArmTestRunner
             }
 
             Console.WriteLine("[循环] 完整采摘流程结束。");
+            return true;
         }
         catch (TaskAbortException ex)
         {
             Console.WriteLine($"[循环] {ex.Message} 停止本次循环。");
+            return false;
         }
         catch (OperationCanceledException)
         {
             Console.WriteLine("[循环] 任务已取消，返回主循环。");
+            return false;
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[循环] 任务执行出错：{ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 切换连续采摘模式。未运行时：启动后台任务循环执行完整采摘流程；
+    /// 运行中：取消循环并主动 Stop 机械臂（阻塞式运动指令不会因取消令牌而中断）。
+    /// 由键盘空格键或手柄 A 键触发。
+    /// </summary>
+    private async Task ToggleContinuousPickingAsync(CancellationToken motionCt)
+    {
+        if (IsContinuousPickingActive)
+        {
+            Console.WriteLine("[连续采摘] 正在停止：取消循环并中断当前运动...");
+            try
+            {
+                _continuousPickingCts?.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // 已释放，忽略
+            }
+
+            // BlockUntilComplete 的阻塞运动不会因取消令牌而停下，需要像急停一样主动 Stop
+            try
+            {
+                await _robot.StopAsync(CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[连续采摘] 调用 StopAsync 失败：{ex.Message}");
+            }
+
+            await CleanupContinuousPickingAsync();
+            Console.WriteLine("[连续采摘] 已停止，返回手动控制。");
+            return;
+        }
+
+        // 清理可能残留的旧任务（例如急停后自动结束的）
+        await CleanupContinuousPickingAsync();
+
+        _continuousPickingCts = CancellationTokenSource.CreateLinkedTokenSource(motionCt);
+        _continuousPickingTask = RunContinuousPickingAsync(_continuousPickingCts.Token);
+        Console.WriteLine("[连续采摘] 已开始：循环执行 Home → Far → Near → Place。");
+        Console.WriteLine("[连续采摘] 再次按空格 / 手柄 A 停止；B 急停仍然有效。");
+    }
+
+    /// <summary>等待连续采摘后台任务结束并释放其取消令牌源。</summary>
+    private async Task CleanupContinuousPickingAsync()
+    {
+        if (_continuousPickingTask != null)
+        {
+            try
+            {
+                await _continuousPickingTask;
+            }
+            catch (OperationCanceledException)
+            {
+                // 正常停止
+            }
+            _continuousPickingTask = null;
+        }
+
+        _continuousPickingCts?.Dispose();
+        _continuousPickingCts = null;
+    }
+
+    /// <summary>
+    /// 连续采摘后台循环：反复执行完整采摘流程，直到令牌被取消。
+    /// 本轮未采到（无有效目标或出错）时稍作停顿再重试；采到时立即进入下一轮。
+    /// </summary>
+    private async Task RunContinuousPickingAsync(CancellationToken ct)
+    {
+        int cycle = 0;
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                cycle++;
+                Console.WriteLine($"[连续采摘] ===== 第 {cycle} 轮 =====");
+                bool success = await RunFullPickLoopAsync(ct, disableManualFallback: true);
+
+                if (!success && !ct.IsCancellationRequested)
+                {
+                    Console.WriteLine("[连续采摘] 本轮未完成（可能未检测到目标），1.5 秒后重试。");
+                    await Task.Delay(1500, ct);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // 正常停止
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[连续采摘] 循环出错，已停止：{ex.Message}");
         }
     }
 
@@ -770,9 +988,16 @@ public sealed class ArmTestRunner
                     bool bPressed = state.Buttons.HasFlag(GamepadButtonFlags.B);
                     if (bPressed && !previousBPressed)
                     {
-                        await TriggerEmergencyStopAsync("[后台急停] B 键被按下，立即停止机械臂并取消当前任务。");
+                        await TriggerEmergencyStopAsync("[后台急停] 手柄 B 键被按下，立即停止机械臂并取消当前任务。");
                     }
                     previousBPressed = bPressed;
+                }
+
+                // 键盘 B 用 GetAsyncKeyState 直接读物理按键状态，不消费控制台输入缓冲区，
+                // 因此运动中主循环阻塞在任务上时也能立即急停
+                if (_keyboard.ReadBEmergencyStopPressed())
+                {
+                    await TriggerEmergencyStopAsync("[后台急停] 键盘 B 被按下，立即停止机械臂并取消当前任务。");
                 }
 
                 await Task.Delay(5, ct);
@@ -924,5 +1149,21 @@ public sealed class ArmTestRunner
         double sign = Math.Sign(doubleValue);
         double normalized = (abs - deadZone) / (32768.0 - deadZone);
         return sign * Math.Clamp(normalized, 0, 1);
+    }
+
+    /// <summary>
+    /// 获取校验后的 Home 关节角数组。若配置无效（null 或长度不等于 JointDof），
+    /// 打印警告并返回硬编码的默认水平 Home 关节角。
+    /// </summary>
+    private double[] GetValidatedHomeJoints()
+    {
+        var joints = _profile.HomeJoints;
+        if (joints != null && joints.Count == _profile.JointDof)
+        {
+            return joints.ToArray();
+        }
+
+        Console.WriteLine($"[Warning] RobotProfile.HomeJoints 配置无效（count={joints?.Count ?? 0}，期望 {_profile.JointDof}），使用默认 Home 关节角。请检查 appsettings.json 的 RobotProfile.HomeJoints。");
+        return [0, 92.841, -36.654, 0, -126.182, 0];
     }
 }

@@ -5,7 +5,7 @@
 - stdout 只输出一行一条 JSON 响应；
 - 日志统一写 stderr，避免污染 C# 协议读取；
 - capture_near_pose_line 默认 timeout_ms=5000、max_frames=30；
-- 有 trusted 目标则提前返回，否则返回最后一帧结果。
+- 自动任务有 trusted 目标则提前返回；桌面手动实时模式跑完整个单次采样窗口。
 
 安全边界：
 - 只打开相机和运行 YOLO；
@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 import argparse
+import base64
 import json
 import queue
 import sys
@@ -26,21 +27,14 @@ from typing import Any
 
 import numpy as np
 
-from capture_once_near_pose_line_outputs import (
-    DEFAULT_CORE_POINT_RATIO_K0_TO_K2,
-    DEFAULT_Z_OUTLIER_THRESHOLD_M,
+from capture_once_far_bbox_outputs import (
     build_output,
     extract_grape_outputs,
+    get_depth_z,
     has_trusted_grape,
     import_dependencies,
-    rounded_float,
-)
-from capture_once_far_bbox_outputs import (
-    build_output as build_far_output,
-    extract_grape_outputs as extract_far_grape_outputs,
-    get_depth_z,
-    has_trusted_grape as has_trusted_far_grape,
     is_trusted_bbox,
+    rounded_float,
 )
 
 
@@ -60,7 +54,10 @@ DEFAULT_NEAR_TRUST_CONF = 0.2
 DEFAULT_FAR_TRUST_CONF = 0.2
 DEFAULT_IOU = 0.45
 DEFAULT_IMGSZ = 640
-NEAR_FAILURE_TRACE_DIR = ROOT / "outputs" / "near_pose_line_failures"
+# 以下两项仅保留命令行参数兼容性；近端已改为 bbox 模型，实际不再使用
+DEFAULT_Z_OUTLIER_THRESHOLD_M = 0.10
+DEFAULT_CORE_POINT_RATIO_K0_TO_K2 = 0.2
+NEAR_FAILURE_TRACE_DIR = ROOT / "outputs" / "near_bbox_failures"
 FAR_SAFE_CENTER_U_MIN = 200
 FAR_SAFE_CENTER_U_MAX = 1080
 MANUAL_FAR_TIMEOUT_SECONDS = 30.0
@@ -93,7 +90,7 @@ def display_path(path: Path) -> str:
         return path.name
 
 
-def log_capture_frame(mode: str, frame_index: int, output: dict[str, Any], start_time: float) -> None:
+def log_capture_frame(mode: str, frame_index: int, output: dict[str, Any], start_time: float, trust_conf: float = 0.0) -> None:
     trusted = bool(output.get("trusted"))
     grape_count = int(output.get("grape_count", 0) or 0)
     trusted_count = int(output.get("trusted_grape_count", 0) or 0)
@@ -108,9 +105,18 @@ def log_capture_frame(mode: str, frame_index: int, output: dict[str, Any], start
         for grape in grapes:
             if bool(grape.get("trusted")):
                 continue
-            debug = grape.get("debug", {}) if isinstance(grape, dict) else {}
-            reasons = debug.get("failure_reasons", []) if isinstance(debug, dict) else []
-            reason_text = ", ".join(str(reason) for reason in reasons) if reasons else "unknown"
+            bbox = grape.get("bbox", {}) if isinstance(grape, dict) else {}
+            conf = bbox.get("confidence") if isinstance(bbox, dict) else None
+            center_z = bbox.get("center_z") if isinstance(bbox, dict) else None
+            top_center_uv = bbox.get("top_center_uv") if isinstance(bbox, dict) else None
+            reasons: list[str] = []
+            if conf is None or (trust_conf > 0 and float(conf) < trust_conf):
+                reasons.append("BBOX_CONF_LOW")
+            if center_z is None or float(center_z) <= 0:
+                reasons.append("TOP_CENTER_Z_INVALID")
+            if top_center_uv is None:
+                reasons.append("TOP_CENTER_UV_NULL")
+            reason_text = ", ".join(reasons) if reasons else "unknown"
             log(f"near frame={frame_index} fail grape#{grape.get('index')}: {reason_text}")
 
 
@@ -138,13 +144,14 @@ def append_near_failure_trace(trace_path: Path, request_id: Any, frame_index: in
         if not grapes:
             record = {
                 "request_id": request_id,
-                "mode": "near_pose_line",
+                "mode": "near_bbox",
                 "frame_index": frame_index,
                 "elapsed_seconds": output.get("elapsed_seconds"),
                 "frame_trusted": bool(output.get("trusted")),
                 "grape_count": int(output.get("grape_count", 0) or 0),
                 "grape_index": None,
                 "grape_trusted": False,
+                "bbox": {},
                 "failure_reasons": ["NO_GRAPE_DETECTIONS"],
             }
             trace_file.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
@@ -153,34 +160,42 @@ def append_near_failure_trace(trace_path: Path, request_id: Any, frame_index: in
         for grape in grapes:
             if bool(grape.get("trusted")):
                 continue
-            debug = grape.get("debug", {}) if isinstance(grape, dict) else {}
-            reasons = debug.get("failure_reasons", []) if isinstance(debug, dict) else []
+            bbox = grape.get("bbox", {}) if isinstance(grape, dict) else {}
+            conf = bbox.get("confidence") if isinstance(bbox, dict) else None
+            center_z = bbox.get("center_z") if isinstance(bbox, dict) else None
+            top_center_uv = bbox.get("top_center_uv") if isinstance(bbox, dict) else None
+            reasons: list[str] = []
+            if conf is None or float(conf) < 0.01:
+                reasons.append("BBOX_CONF_LOW")
+            if center_z is None or float(center_z) <= 0:
+                reasons.append("TOP_CENTER_Z_INVALID")
+            if top_center_uv is None:
+                reasons.append("TOP_CENTER_UV_NULL")
             record = {
                 "request_id": request_id,
-                "mode": "near_pose_line",
+                "mode": "near_bbox",
                 "frame_index": frame_index,
                 "elapsed_seconds": output.get("elapsed_seconds"),
                 "frame_trusted": bool(output.get("trusted")),
                 "grape_count": int(output.get("grape_count", 0) or 0),
                 "grape_index": grape.get("index"),
                 "grape_trusted": bool(grape.get("trusted")),
-                "k0": compact_point_for_trace(grape.get("keypoint_0", {})),
-                "k2": compact_point_for_trace(grape.get("keypoint_2", {})),
-                "core_point": {
-                    "uv": grape.get("core_point", {}).get("uv"),
-                    "confidence": grape.get("core_point", {}).get("confidence"),
-                    "trusted": grape.get("core_point", {}).get("trusted"),
-                    "z": grape.get("core_point", {}).get("z"),
-                    "ratio_k0_to_k2": debug.get("core_point_ratio_k0_to_k2") if isinstance(debug, dict) else None,
-                },
+                "bbox": {
+                    "xyxy": bbox.get("xyxy"),
+                    "center_uv": bbox.get("center_uv"),
+                    "top_center_uv": top_center_uv,
+                    "center_z": center_z,
+                    "confidence": conf,
+                    "trusted": bbox.get("trusted"),
+                } if isinstance(bbox, dict) else {},
                 "failure_reasons": reasons if reasons else ["UNKNOWN"],
             }
             trace_file.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="D435 + YOLO near_pose_line 常驻视觉 Worker")
-    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH, help="YOLO .pt 模型路径")
+    parser = argparse.ArgumentParser(description="D435 + YOLO 常驻视觉 Worker（近端/远端均使用 bbox 模型）")
+    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH, help="近端 bbox YOLO .pt 模型路径")
     parser.add_argument("--far-model", type=Path, default=FAR_DEFAULT_MODEL_PATH, help="远端 bbox YOLO .pt 模型路径")
     parser.add_argument("--serial", type=str, default=DEFAULT_SERIAL, help="RealSense 序列号；只有一台相机时可不填")
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH, help="彩色流宽度")
@@ -189,10 +204,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP, help="启动后丢弃的预热帧数")
     parser.add_argument("--frame-timeout-ms", type=int, default=DEFAULT_FRAME_TIMEOUT_MS, help="等待单帧的超时时间，单位毫秒")
     parser.add_argument("--conf", type=float, default=DEFAULT_CONF, help="YOLO 置信度阈值")
-    parser.add_argument("--near-trust-conf", type=float, default=DEFAULT_NEAR_TRUST_CONF, help="近端关键点可信度阈值")
+    parser.add_argument("--near-trust-conf", type=float, default=DEFAULT_NEAR_TRUST_CONF, help="近端 bbox 可信度阈值；confidence >= 该值且 top_center 深度有效则 grape trusted=true")
     parser.add_argument("--far-trust-conf", type=float, default=DEFAULT_FAR_TRUST_CONF, help="远端 bbox 可信度阈值")
-    parser.add_argument("--z-outlier-threshold", type=float, default=DEFAULT_Z_OUTLIER_THRESHOLD_M, help="core_point z 离群过滤阈值，单位米")
-    parser.add_argument("--core-point-ratio-k0-to-k2", type=float, default=DEFAULT_CORE_POINT_RATIO_K0_TO_K2, help="core_point uv 在 K0->K2 连线上的比例；0=K0，0.5=中点，1=K2")
+    parser.add_argument("--z-outlier-threshold", type=float, default=DEFAULT_Z_OUTLIER_THRESHOLD_M, help="已废弃：近端改为 bbox 模型后不再使用")
+    parser.add_argument("--core-point-ratio-k0-to-k2", type=float, default=DEFAULT_CORE_POINT_RATIO_K0_TO_K2, help="已废弃：近端改为 bbox 模型后不再使用")
     parser.add_argument("--iou", type=float, default=DEFAULT_IOU, help="YOLO NMS IoU 阈值")
     parser.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ, help="YOLO 推理尺寸")
     parser.add_argument("--device", type=str, default=None, help="推理设备，例如 cpu、0；默认自动选择")
@@ -213,11 +228,12 @@ class VisionWorker:
 
         log("importing dependencies")
         self.rs, yolo = import_dependencies()
-        self.cv2 = None
+        # OpenCV 同时负责生成回传给 TeachPendant 的 JPEG。只有显式启用
+        # --debug-view 时才创建 cv2 窗口，避免桌面端额外弹出独立视觉窗口。
+        import cv2
+        self.cv2 = cv2
         if args.debug_view:
             log("initializing debug view")
-            import cv2
-            self.cv2 = cv2
             cv2.namedWindow(DEBUG_WINDOW_NAME, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(DEBUG_WINDOW_NAME, 1920, 540)
             show_startup_debug_window(self.cv2, "Import dependencies done")
@@ -225,7 +241,7 @@ class VisionWorker:
         log(f"loading model: {display_path(model_path)}")
         self.model = yolo(str(model_path))
         self.names = dict(self.model.names)
-        if self.cv2 is not None:
+        if args.debug_view:
             show_startup_debug_window(self.cv2, f"Near model loaded: {display_path(model_path)}")
 
         log(f"loading far bbox model: {display_path(far_model_path)}")
@@ -233,8 +249,12 @@ class VisionWorker:
         self.far_names = dict(self.far_model.names)
         self.latest_grapes: list[dict[str, Any]] = []
         self.latest_output: dict[str, Any] | None = None
+        self.latest_original_frame: np.ndarray | None = None
         self.latest_inference_frame: np.ndarray | None = None
         self.latest_mode = "IDLE"
+        self.last_preview_emit_at = 0.0
+        self.capture_cancel_lock = threading.Lock()
+        self.cancelled_capture_request_ids: set[int] = set()
         self.manual_state: dict[str, Any] = {
             "drawing": False,
             "start": None,
@@ -244,7 +264,7 @@ class VisionWorker:
         }
         if args.rotate_180:
             log("rotate-180 enabled: inference frame will be rotated 180°, output coords are in original camera frame")
-        if self.cv2 is not None:
+        if args.debug_view:
             show_startup_debug_window(self.cv2, f"Far model loaded: {display_path(far_model_path)}")
 
         self.pipeline = self.rs.pipeline()
@@ -255,7 +275,7 @@ class VisionWorker:
         config.enable_stream(self.rs.stream.depth, args.width, args.height, self.rs.format.z16, args.fps)
         self.align = self.rs.align(self.rs.stream.color)
         log(f"starting RealSense serial={args.serial or '<default>'}, {args.width}x{args.height}@{args.fps}")
-        if self.cv2 is not None:
+        if args.debug_view:
             show_startup_debug_window(self.cv2, f"Starting RealSense serial={args.serial or '<default>'}")
         self.pipeline.start(config)
 
@@ -264,17 +284,42 @@ class VisionWorker:
             log(f"warming up RealSense frames: {warmup_frames}")
         for index in range(warmup_frames):
             self.pipeline.wait_for_frames(args.frame_timeout_ms)
-            if self.cv2 is not None and (index == 0 or index == warmup_frames - 1 or (index + 1) % 5 == 0):
+            if args.debug_view and (index == 0 or index == warmup_frames - 1 or (index + 1) % 5 == 0):
                 show_startup_debug_window(self.cv2, f"Warming up D435 frame {index + 1}/{warmup_frames}")
         log("ready")
 
     def close(self) -> None:
-        if self.cv2 is not None:
+        if self.args.debug_view:
             self.cv2.destroyAllWindows()
         try:
             self.pipeline.stop()
         except Exception as exc:  # noqa: BLE001
             log(f"pipeline.stop ignored error: {exc}")
+
+    def request_capture_cancel(self, request_id: Any) -> None:
+        try:
+            normalized_id = int(request_id)
+        except (TypeError, ValueError):
+            return
+        with self.capture_cancel_lock:
+            self.cancelled_capture_request_ids.add(normalized_id)
+        log(f"capture cancel requested: request_id={normalized_id}")
+
+    def is_capture_cancelled(self, request: dict[str, Any]) -> bool:
+        try:
+            request_id = int(request.get("id"))
+        except (TypeError, ValueError):
+            return False
+        with self.capture_cancel_lock:
+            return request_id in self.cancelled_capture_request_ids
+
+    def clear_capture_cancel(self, request: dict[str, Any]) -> None:
+        try:
+            request_id = int(request.get("id"))
+        except (TypeError, ValueError):
+            return
+        with self.capture_cancel_lock:
+            self.cancelled_capture_request_ids.discard(request_id)
 
     def read_aligned_frame(self, timeout_ms: int) -> tuple[np.ndarray, Any]:
         frames = self.pipeline.wait_for_frames(timeout_ms)
@@ -307,7 +352,7 @@ class VisionWorker:
             selected_index = self.latest_output.get("selected_grape_index")
             trusted_output = bool(self.latest_output.get("trusted"))
 
-        model_name = "far_bbox" if self.latest_mode == "FAR" else "near_pose_line"
+        model_name = "far_bbox" if self.latest_mode == "FAR" else "near_bbox"
         header_color = (0, 255, 0) if trusted_output else (0, 255, 255)
         self.cv2.putText(view, f"MODEL={model_name} MODE={self.latest_mode} trusted={trusted_output} selected={selected_index}", (20, 35), self.cv2.FONT_HERSHEY_SIMPLEX, 0.75, header_color, 2)
         self.cv2.putText(view, label, (20, 68), self.cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
@@ -362,17 +407,16 @@ class VisionWorker:
 
         return view
 
-    def update_debug_view(self, frame: np.ndarray, depth_frame: Any, manual_active: bool = False) -> None:
-        if self.cv2 is None:
-            return
-
+    def build_preview_canvas(self, frame: np.ndarray, manual_active: bool = False) -> np.ndarray:
+        """生成与原调试窗口一致的双画面：左原始相机帧，右实际推理帧。"""
         use_rotated = self.args.rotate_180 and self.latest_inference_frame is not None
 
         original_view = self._annotate_view(frame, "ORIGINAL (camera frame)", use_original_coords=True)
         if use_rotated:
             rotated_view = self._annotate_view(self.latest_inference_frame, "ROTATED 180 (inference frame)", use_original_coords=False)
         else:
-            rotated_view = np.rot90(original_view, 2).copy()
+            inference_frame = self.latest_inference_frame if self.latest_inference_frame is not None else frame
+            rotated_view = self._annotate_view(inference_frame, "INFERENCE FRAME", use_original_coords=True)
 
         # 双栏并排显示：左为彩色原图，右为旋转后的推理帧
         # 单张缩放为 960x540，总窗口 1920x540
@@ -384,8 +428,70 @@ class VisionWorker:
         if manual_active:
             self.cv2.putText(combined, "MANUAL: L pane | Enter=confirm | R/Back=reset | Esc/Q/O=exit", (20, 30), self.cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
 
+        return combined
+
+    def update_debug_view(self, frame: np.ndarray, depth_frame: Any, manual_active: bool = False) -> None:
+        if not self.args.debug_view:
+            return
+
+        combined = self.build_preview_canvas(frame, manual_active)
         self.cv2.imshow(DEBUG_WINDOW_NAME, combined)
         self.cv2.waitKey(1)
+
+    def encode_preview_jpeg(self, frame: np.ndarray, quality: int = 78) -> str | None:
+        """编码桌面端单画面：始终显示与 YOLO 输入方向一致的翻转后画面。"""
+        try:
+            inference_frame = np.rot90(frame, 2).copy() if self.args.rotate_180 else frame.copy()
+            label = "ROTATED 180 - YOLO VIEW" if self.args.rotate_180 else "YOLO VIEW"
+            preview = self._annotate_view(
+                inference_frame,
+                label,
+                # 检测结果统一保存为原始相机坐标；显示翻转画面时需把标注坐标同步翻转。
+                use_original_coords=not self.args.rotate_180,
+            )
+            ok, encoded = self.cv2.imencode(
+                ".jpg",
+                preview,
+                [int(self.cv2.IMWRITE_JPEG_QUALITY), quality],
+            )
+            if ok:
+                return base64.b64encode(encoded.tobytes()).decode("ascii")
+        except Exception as exc:  # noqa: BLE001
+            log(f"preview jpeg encode failed: {exc}")
+        return None
+
+    def emit_preview_event(self, request: dict[str, Any], frame: np.ndarray) -> None:
+        """在同一视觉请求内节流回传预览帧；不额外读取相机。"""
+        if not request.get("emit_preview", False):
+            return
+        now = time.monotonic()
+        if now - self.last_preview_emit_at < 0.15:
+            return
+        encoded = self.encode_preview_jpeg(frame, quality=74)
+        if encoded is None:
+            return
+        self.last_preview_emit_at = now
+        write_response({
+            "type": "preview",
+            "id": request.get("id"),
+            "command": request.get("command"),
+            "mode": (
+                f"{self.latest_mode.title()} 手动实时检测"
+                if request.get("manual_realtime_preview", False)
+                else f"{self.latest_mode.title()} 自动任务截帧"
+            ),
+            "captured_at": datetime.now().isoformat(timespec="milliseconds"),
+            "preview_jpeg_base64": encoded,
+        })
+
+    def attach_preview_image(self, output: dict[str, Any]) -> None:
+        """附加最近一次翻转后 YOLO 单画面 JPEG；只用于桌面显示。"""
+        frame = self.latest_original_frame
+        if frame is None:
+            return
+        encoded = self.encode_preview_jpeg(frame, quality=86)
+        if encoded is not None:
+            output["preview_jpeg_base64"] = encoded
 
     # ------------------------------------------------------------------
     # 远端 far bbox 手动标定（鼠标画框）
@@ -490,7 +596,8 @@ class VisionWorker:
             return
         elapsed = 0.0
         self.latest_grapes = [grape]
-        self.latest_output = build_far_output(frame, self.latest_grapes, elapsed, "manual_annotation", trust_conf)
+        self.latest_output = build_output(frame, self.latest_grapes, elapsed, "manual_annotation", trust_conf)
+        self.latest_original_frame = frame.copy()
         self.latest_inference_frame = np.rot90(frame, 2).copy() if self.args.rotate_180 else frame
         self.latest_mode = "FAR"
 
@@ -542,9 +649,10 @@ class VisionWorker:
                             grape = self._build_manual_grape(fresh_frame, fresh_depth, start, end, trust_conf)
                             if grape is not None and grape["bbox"]["center_z"] is not None:
                                 elapsed = time.monotonic() - start_time
-                                result = build_far_output(fresh_frame, [grape], elapsed, selection_rule, trust_conf)
+                                result = build_output(fresh_frame, [grape], elapsed, selection_rule, trust_conf, request.get("selection_weights"))
                                 self.latest_grapes = [grape]
                                 self.latest_output = result
+                                self.latest_original_frame = fresh_frame.copy()
                                 self.latest_inference_frame = np.rot90(fresh_frame, 2).copy() if self.args.rotate_180 else fresh_frame
                                 self.latest_mode = "FAR"
                                 log("manual far bbox confirmed")
@@ -562,18 +670,43 @@ class VisionWorker:
 
         return result
 
-    def capture_near_pose_line(self, request: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    def capture_near_bbox(self, request: dict[str, Any]) -> tuple[dict[str, Any], int]:
         timeout_ms = int(request.get("timeout_ms", DEFAULT_CAPTURE_TIMEOUT_MS))
         max_frames = int(request.get("max_frames", DEFAULT_MAX_FRAMES))
+        manual_realtime_preview = bool(request.get("manual_realtime_preview", False))
         deadline = time.monotonic() + max(1, timeout_ms) / 1000.0
         start_time = time.monotonic()
-        trace_path = make_near_failure_trace_path(request.get("id"))
-        log(f"near failure trace: {display_path(trace_path)}")
+        # 长时间手动预览不落盘逐帧失败追踪，避免持续运行时不断创建诊断文件。
+        trace_path = None if manual_realtime_preview else make_near_failure_trace_path(request.get("id"))
+        if trace_path is not None:
+            log(f"near failure trace: {display_path(trace_path)}")
         last_output: dict[str, Any] | None = None
+        best_trusted_output: dict[str, Any] | None = None
+        best_trusted_grapes: list[dict[str, Any]] | None = None
+        best_trusted_frame: np.ndarray | None = None
+        best_trusted_inference_frame: np.ndarray | None = None
         frames_processed = 0
+        trust_conf = float(request.get("trust_conf", self.args.near_trust_conf))
 
-        while frames_processed < max(1, max_frames) and time.monotonic() < deadline:
-            frame, depth_frame = self.read_aligned_frame(self.args.frame_timeout_ms)
+        while (
+            (manual_realtime_preview or frames_processed < max(1, max_frames))
+            and time.monotonic() < deadline
+            and not self.is_capture_cancelled(request)
+        ):
+            frame_timeout_ms = self.args.frame_timeout_ms
+            if manual_realtime_preview:
+                remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+                frame_timeout_ms = min(frame_timeout_ms, remaining_ms, 300)
+            try:
+                frame, depth_frame = self.read_aligned_frame(frame_timeout_ms)
+            except RuntimeError:
+                if manual_realtime_preview:
+                    if self.is_capture_cancelled(request) or time.monotonic() >= deadline:
+                        break
+                    continue
+                raise
+            if self.is_capture_cancelled(request):
+                break
             inference_frame = np.rot90(frame, 2).copy() if self.args.rotate_180 else frame
             results = self.model.predict(
                 source=inference_frame,
@@ -583,42 +716,68 @@ class VisionWorker:
                 device=request.get("device", self.args.device),
                 verbose=False,
             )
+            if self.is_capture_cancelled(request):
+                break
             grapes = extract_grape_outputs(
                 results[0],
                 self.names,
                 depth_frame,
                 int(frame.shape[1]),
                 int(frame.shape[0]),
-                float(request.get("trust_conf", self.args.near_trust_conf)),
-                float(request.get("z_outlier_threshold", self.args.z_outlier_threshold)),
-                float(request.get("core_point_ratio_k0_to_k2", self.args.core_point_ratio_k0_to_k2)),
+                trust_conf,
                 rotate_180=self.args.rotate_180,
             )
             frames_processed += 1
-            last_output = build_output(frame, grapes, time.monotonic() - start_time)
+            last_output = build_output(
+                frame,
+                grapes,
+                time.monotonic() - start_time,
+                str(request.get("selection_rule", "largest_nearest_lowest_top")),
+                trust_conf,
+                request.get("selection_weights"),
+            )
             self.latest_grapes = grapes
             self.latest_output = last_output
+            self.latest_original_frame = frame.copy()
             self.latest_inference_frame = inference_frame
             self.latest_mode = "NEAR"
             self.update_debug_view(frame, depth_frame)
-            log_capture_frame("near", frames_processed, last_output, start_time)
-            if not has_trusted_grape(last_output):
+            self.emit_preview_event(request, frame)
+            if not manual_realtime_preview:
+                log_capture_frame("near", frames_processed, last_output, start_time, trust_conf)
+            if trace_path is not None and not has_trusted_grape(last_output):
                 append_near_failure_trace(trace_path, request.get("id"), frames_processed, last_output)
             if has_trusted_grape(last_output):
-                return last_output, frames_processed
+                if not manual_realtime_preview:
+                    return last_output, frames_processed
+                # 手动实时模式继续跑完整个单次采样窗口，同时保留最近可信帧作为结果。
+                best_trusted_output = last_output
+                best_trusted_grapes = list(grapes)
+                best_trusted_frame = frame.copy()
+                best_trusted_inference_frame = inference_frame.copy()
+
+        if best_trusted_output is not None:
+            self.latest_output = best_trusted_output
+            self.latest_grapes = best_trusted_grapes or []
+            self.latest_original_frame = best_trusted_frame
+            self.latest_inference_frame = best_trusted_inference_frame
+            self.latest_mode = "NEAR"
+            return best_trusted_output, frames_processed
 
         if last_output is None:
             last_output = {
                 "trusted": False,
                 "trusted_grape_count": 0,
                 "selected_grape_index": None,
-                "selection_rule": "nearest_core_point_z_among_trusted_grapes",
+                "selection_rule": str(request.get("selection_rule", "largest_nearest_lowest_top")),
+                "model_type": "near_bbox",
                 "image": {"width": int(self.args.width), "height": int(self.args.height)},
                 "elapsed_seconds": rounded_float(time.monotonic() - start_time),
                 "grape_count": 0,
                 "grapes": [],
             }
-            append_near_failure_trace(trace_path, request.get("id"), frames_processed, last_output)
+            if trace_path is not None:
+                append_near_failure_trace(trace_path, request.get("id"), frames_processed, last_output)
 
         return last_output, frames_processed
 
@@ -628,7 +787,12 @@ class VisionWorker:
         deadline = time.monotonic() + max(1, timeout_ms) / 1000.0
         start_time = time.monotonic()
         last_output: dict[str, Any] | None = None
+        best_trusted_output: dict[str, Any] | None = None
+        best_trusted_grapes: list[dict[str, Any]] | None = None
+        best_trusted_frame: np.ndarray | None = None
+        best_trusted_inference_frame: np.ndarray | None = None
         frames_processed = 0
+        manual_realtime_preview = bool(request.get("manual_realtime_preview", False))
 
         # 强制手动模式：跳过自动检测，直接进入手动画框标定
         if request.get("force_manual"):
@@ -640,7 +804,7 @@ class VisionWorker:
                     manual_output = self.run_manual_far_annotation(
                         frame,
                         depth_frame,
-                        str(request.get("selection_rule", "nearest_center_z")),
+                        str(request.get("selection_rule", "largest_nearest_lowest_top")),
                         float(request.get("trust_conf", self.args.far_trust_conf)),
                     )
                     if manual_output is not None:
@@ -648,8 +812,25 @@ class VisionWorker:
                 except Exception as exc:  # noqa: BLE001
                     log(f"forced manual far annotation failed: {exc}")
 
-        while frames_processed < max(1, max_frames) and time.monotonic() < deadline:
-            frame, depth_frame = self.read_aligned_frame(self.args.frame_timeout_ms)
+        while (
+            (manual_realtime_preview or frames_processed < max(1, max_frames))
+            and time.monotonic() < deadline
+            and not self.is_capture_cancelled(request)
+        ):
+            frame_timeout_ms = self.args.frame_timeout_ms
+            if manual_realtime_preview:
+                remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+                frame_timeout_ms = min(frame_timeout_ms, remaining_ms, 300)
+            try:
+                frame, depth_frame = self.read_aligned_frame(frame_timeout_ms)
+            except RuntimeError:
+                if manual_realtime_preview:
+                    if self.is_capture_cancelled(request) or time.monotonic() >= deadline:
+                        break
+                    continue
+                raise
+            if self.is_capture_cancelled(request):
+                break
             inference_frame = np.rot90(frame, 2).copy() if self.args.rotate_180 else frame
             results = self.far_model.predict(
                 source=inference_frame,
@@ -659,7 +840,9 @@ class VisionWorker:
                 device=request.get("device", self.args.device),
                 verbose=False,
             )
-            grapes = extract_far_grape_outputs(
+            if self.is_capture_cancelled(request):
+                break
+            grapes = extract_grape_outputs(
                 results[0],
                 self.far_names,
                 depth_frame,
@@ -669,22 +852,45 @@ class VisionWorker:
                 rotate_180=self.args.rotate_180,
             )
             frames_processed += 1
-            last_output = build_far_output(frame, grapes, time.monotonic() - start_time, str(request.get("selection_rule", "nearest_center_z")), float(request.get("trust_conf", self.args.far_trust_conf)))
+            last_output = build_output(
+                frame,
+                grapes,
+                time.monotonic() - start_time,
+                str(request.get("selection_rule", "largest_nearest_lowest_top")),
+                float(request.get("trust_conf", self.args.far_trust_conf)),
+                request.get("selection_weights"),
+            )
             self.latest_grapes = grapes
             self.latest_output = last_output
+            self.latest_original_frame = frame.copy()
             self.latest_inference_frame = inference_frame
             self.latest_mode = "FAR"
             self.update_debug_view(frame, depth_frame)
-            log_capture_frame("far", frames_processed, last_output, start_time)
-            if has_trusted_far_grape(last_output):
-                return last_output, frames_processed
+            self.emit_preview_event(request, frame)
+            if not manual_realtime_preview:
+                log_capture_frame("far", frames_processed, last_output, start_time)
+            if has_trusted_grape(last_output):
+                if not manual_realtime_preview:
+                    return last_output, frames_processed
+                best_trusted_output = last_output
+                best_trusted_grapes = list(grapes)
+                best_trusted_frame = frame.copy()
+                best_trusted_inference_frame = inference_frame.copy()
+
+        if best_trusted_output is not None:
+            self.latest_output = best_trusted_output
+            self.latest_grapes = best_trusted_grapes or []
+            self.latest_original_frame = best_trusted_frame
+            self.latest_inference_frame = best_trusted_inference_frame
+            self.latest_mode = "FAR"
+            return best_trusted_output, frames_processed
 
         if last_output is None:
             last_output = {
                 "trusted": False,
                 "trusted_grape_count": 0,
                 "selected_grape_index": None,
-                "selection_rule": str(request.get("selection_rule", "nearest_center_z")),
+                "selection_rule": str(request.get("selection_rule", "largest_nearest_lowest_top")),
                 "model_type": "far_bbox",
                 "image": {"width": int(self.args.width), "height": int(self.args.height)},
                 "elapsed_seconds": rounded_float(time.monotonic() - start_time),
@@ -694,12 +900,12 @@ class VisionWorker:
 
         # 自动检测失败且启用了调试窗口时，进入手动画框标定
         allow_manual_fallback = request.get("allow_manual_fallback", True)
-        if not has_trusted_far_grape(last_output) and allow_manual_fallback and self.cv2 is not None and self.args.debug_view:
+        if not has_trusted_grape(last_output) and allow_manual_fallback and self.cv2 is not None and self.args.debug_view:
             try:
                 manual_output = self.run_manual_far_annotation(
                     frame,
                     depth_frame,
-                    str(request.get("selection_rule", "nearest_center_z")),
+                    str(request.get("selection_rule", "largest_nearest_lowest_top")),
                     float(request.get("trust_conf", self.args.far_trust_conf)),
                 )
                 if manual_output is not None:
@@ -710,7 +916,7 @@ class VisionWorker:
         return last_output, frames_processed
 
     def poll_camera_for_debug_view(self) -> None:
-        if self.cv2 is None:
+        if not self.args.debug_view:
             return
         try:
             frame, depth_frame = self.read_aligned_frame(100)
@@ -724,14 +930,20 @@ class VisionWorker:
         started = time.monotonic()
 
         if command == "ping":
-            return {"id": request_id, "ok": True, "command": command, "result": "pong"}
+            return {"type": "response", "id": request_id, "ok": True, "command": command, "result": "pong"}
 
         if command == "shutdown":
-            return {"id": request_id, "ok": True, "command": command, "result": "bye"}
+            return {"type": "response", "id": request_id, "ok": True, "command": command, "result": "bye"}
 
         if command == "capture_near_pose_line":
-            output, frames_processed = self.capture_near_pose_line(request)
+            # 命令名保持与 C# 兼容，内部已改为 near bbox 模型后处理
+            try:
+                output, frames_processed = self.capture_near_bbox(request)
+            finally:
+                self.clear_capture_cancel(request)
+            self.attach_preview_image(output)
             return {
+                "type": "response",
                 "id": request_id,
                 "ok": True,
                 "command": command,
@@ -741,8 +953,13 @@ class VisionWorker:
             }
 
         if command == "capture_far_bbox":
-            output, frames_processed = self.capture_far_bbox(request)
+            try:
+                output, frames_processed = self.capture_far_bbox(request)
+            finally:
+                self.clear_capture_cancel(request)
+            self.attach_preview_image(output)
             return {
+                "type": "response",
                 "id": request_id,
                 "ok": True,
                 "command": command,
@@ -752,6 +969,7 @@ class VisionWorker:
             }
 
         return {
+            "type": "response",
             "id": request_id,
             "ok": False,
             "command": command,
@@ -763,10 +981,26 @@ def write_response(response: dict[str, Any]) -> None:
     print(json.dumps(response, ensure_ascii=False, separators=(",", ":")), flush=True)
 
 
-def start_stdin_reader(lines: "queue.Queue[str | None]") -> threading.Thread:
+def start_stdin_reader(
+    lines: "queue.Queue[str | None]",
+    worker: VisionWorker,
+) -> threading.Thread:
     def run() -> None:
         try:
             for line in sys.stdin:
+                try:
+                    message = json.loads(line)
+                    if (
+                        isinstance(message, dict)
+                        and message.get("type") == "control"
+                        and message.get("command") == "cancel_capture"
+                    ):
+                        # 控制消息由 stdin 线程立即处理，不排到正在阻塞的普通请求之后。
+                        worker.request_capture_cancel(message.get("target_request_id"))
+                        continue
+                except (json.JSONDecodeError, TypeError):
+                    # 普通请求仍交给主线程统一解析和返回协议错误。
+                    pass
                 lines.put(line)
         finally:
             lines.put(None)
@@ -782,7 +1016,7 @@ def main() -> int:
     try:
         worker = VisionWorker(args)
         lines: queue.Queue[str | None] = queue.Queue()
-        start_stdin_reader(lines)
+        start_stdin_reader(lines, worker)
         while True:
             worker.poll_camera_for_debug_view()
             try:
@@ -795,15 +1029,20 @@ def main() -> int:
             line = line.strip()
             if not line:
                 continue
+            request_id = None
+            request_command = None
             try:
                 request = json.loads(line)
+                request_id = request.get("id")
+                request_command = request.get("command")
                 response = worker.handle_request(request)
             except Exception as exc:  # noqa: BLE001
                 log(f"request failed: {exc}")
                 response = {
-                    "id": None,
+                    "type": "response",
+                    "id": request_id,
                     "ok": False,
-                    "command": None,
+                    "command": request_command,
                     "error": {"code": "WORKER_ERROR", "message": str(exc)},
                 }
             write_response(response)
@@ -812,7 +1051,7 @@ def main() -> int:
         return 0
     except Exception as exc:  # noqa: BLE001
         log(f"fatal: {exc}")
-        write_response({"id": None, "ok": False, "command": "startup", "error": {"code": "STARTUP_ERROR", "message": str(exc)}})
+        write_response({"type": "startup_error", "id": None, "ok": False, "command": "startup", "error": {"code": "STARTUP_ERROR", "message": str(exc)}})
         return 1
     finally:
         if worker is not None:

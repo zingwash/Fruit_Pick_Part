@@ -12,7 +12,7 @@ class Program
 {
     static async Task Main(string[] args)
     {
-        Console.WriteLine("=== FruitPickPart Step 5: 固定点位采摘循环 ===");
+        Console.WriteLine("=== FruitPickPart ===");
         Console.WriteLine("按 Q 可退出程序。");
         Console.WriteLine();
 
@@ -83,7 +83,7 @@ class Program
             var nearPickTask = new NearPickTask(profile, nearPickProfile);
             var placeTask = new PlaceTask(profile, placeProfile);
 
-            var runner = new ArmTestRunner(robot, profile, gripper, perception, transformer, pickTask, farApproachTask, nearPickTask, placeTask);
+            var runner = new ArmTestRunner(robot, profile, gripper, perception, transformer, pickTask, farApproachTask, farApproachProfile, nearPickTask, nearPickProfile, placeTask);
 
             using var cts = new CancellationTokenSource();
             Console.CancelKeyPress += (sender, e) =>
