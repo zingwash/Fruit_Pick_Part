@@ -1,5 +1,7 @@
 # Fruit_Pick_Part 架构说明
 
+> 第一次接触项目时，建议先阅读 [《项目通用说明：目录、文件职责与调用关系》](PROJECT_GUIDE.md)。
+
 本目录是 `rm65-d435-yolo-pick-runner` 的通用化重写项目。
 
 ## 核心设计原则
