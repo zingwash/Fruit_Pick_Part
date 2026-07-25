@@ -2546,7 +2546,9 @@ public sealed class TeachPendantForm : Form
             && !_visionStopInProgress
             && !_closing
             && !_visualPickRunning
-            && (idle || detectionInProgress);
+            // 复用自动任务留下的 worker 启动手动实时检测时，普通命令门已经被占用，
+            // 但停止按钮必须立即可用，不能依赖稍后才落到界面的“检测中”状态。
+            && (idle || detectionInProgress || _manualVisionLiveRunning);
         _fixedWaypointTaskButton.Enabled = connected
             && IsGripperReady
             && idle
@@ -3168,12 +3170,8 @@ public sealed class TeachPendantForm : Form
                     ? $"{e.Mode}：{e.CapturedAt:yyyy-MM-dd HH:mm:ss.fff}（持续刷新；停止后保留最后画面）"
                     : $"{e.Mode}：{e.CapturedAt:yyyy-MM-dd HH:mm:ss.fff}（自动任务节省资源，仅显示检测截帧）";
                 _visionPreviewStatusLabel.ForeColor = Color.ForestGreen;
-                // 自动任务正在进行阶段轨迹审批时只更新最近画面，不抢走审批页焦点。
-                if (!_visualPickRunning || !IsMotionPreviewEnabled)
-                {
-                    _visionDisplayTabs.SelectedTab = _visionImagePage;
-                    _mainTabs.SelectedTab = _visionPage;
-                }
+                // 启动手动检测时 ShowManualRealtimeDetection 会主动打开视觉页一次。
+                // 后续帧只刷新画面，不再抢夺栏目焦点，否则用户无法切换到其他页面。
             }
             catch (Exception ex)
             {
@@ -3247,10 +3245,11 @@ public sealed class TeachPendantForm : Form
         bool detectionException = false;
         bool commandCompleted = await RunCommandAsync(operation, async ct =>
         {
-            SetDeviceStatus(DeviceKind.DepthCamera, "检测中", Color.DarkOrange);
             _manualVisionStopRequested = false;
             _manualVisionLiveRunning = true;
             _manualVisionLiveMode = "Far";
+            SetDeviceStatus(DeviceKind.DepthCamera, "检测中", Color.DarkOrange);
+            BeginInvoke(new Action(UpdateControlAvailability));
             try
             {
                 IPerception perception = await EnsurePerceptionStartedAsync();
@@ -3308,10 +3307,11 @@ public sealed class TeachPendantForm : Form
         bool detectionException = false;
         bool commandCompleted = await RunCommandAsync(operation, async ct =>
         {
-            SetDeviceStatus(DeviceKind.DepthCamera, "检测中", Color.DarkOrange);
             _manualVisionStopRequested = false;
             _manualVisionLiveRunning = true;
             _manualVisionLiveMode = "Near";
+            SetDeviceStatus(DeviceKind.DepthCamera, "检测中", Color.DarkOrange);
+            BeginInvoke(new Action(UpdateControlAvailability));
             try
             {
                 IPerception perception = await EnsurePerceptionStartedAsync();
