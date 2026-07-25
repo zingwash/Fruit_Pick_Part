@@ -32,7 +32,12 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent
 DEFAULT_MODEL_PATH = ROOT / "models" / "far_bbox.pt"
 DEFAULT_OUTPUT_DIR = ROOT / "outputs" / "far_bbox"
-TARGET_CLASS_NAMES = {"grape_far", "grape_close"}
+TARGET_CLASS_NAMES = {
+    "grape_far",
+    "grape_close",
+    "grape_XiaHei",
+    "grape_YangGuangMeiGui",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -264,6 +269,7 @@ def extract_grape_outputs(
 
         grapes.append({
             "index": len(grapes),
+            "class_name": class_name,
             "trusted": trusted,
             "bbox": {
                 "xyxy": [int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))],

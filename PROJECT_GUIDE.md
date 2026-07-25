@@ -178,11 +178,12 @@ flowchart LR
 | [`VisionPython/capture_once_far_bbox_outputs.py`](VisionPython/capture_once_far_bbox_outputs.py) | Far bbox 推理与结果整理函数：深度采样、可信度判断、多目标评分、180° 坐标换算和输出格式化。也可作为独立单次检测脚本运行。 |
 | [`VisionPython/capture_once_near_pose_line_outputs.py`](VisionPython/capture_once_near_pose_line_outputs.py) | Near 检测算法和结果整理。文件名保留早期 `pose_line` 命名，但当前 worker 的 Near 命令实际走 bbox 检测兼容路径。 |
 | [`VisionPython/inspect_model.py`](VisionPython/inspect_model.py) | 独立模型检查工具；可选择图片或视频，运行 YOLO 并显示/保存标注效果，不参与正式自动任务。 |
+| [`VisionPython/MODEL_MANIFEST.md`](VisionPython/MODEL_MANIFEST.md) | 记录未纳入 Git 的模型文件名、大小、哈希、类别和部署位置。 |
 | `VisionPython/models/` | 本机 YOLO `.pt/.onnx` 权重。被 `.gitignore` 排除，不会随普通 Git 推送上传。新电脑需要单独放置模型。 |
 | `VisionPython/outputs/` | 调试图片、检测失败追踪等运行输出。被 Git 忽略，可按需清理。 |
 | `VisionPython/__pycache__/` | Python 自动生成的字节码缓存，不需要维护或提交。 |
 
-C# 与 Python 之间使用“一行一个 JSON 对象”的标准输入/输出协议。Python 的标准输出必须保持协议格式；普通调试信息应写到标准错误，否则会破坏 C# 解析。
+C# 与 Python 之间使用“一行一个 JSON 对象”的标准输入/输出协议。Python 的标准输出必须保持协议格式；普通调试信息应写到标准错误，否则会破坏 C# 解析。当前成员模型使用 `grape_XiaHei`、`grape_YangGuangMeiGui` 两个类别，程序同时兼容旧模型类别。
 
 ## 14. `TeachPendant/`：桌面示教器
 

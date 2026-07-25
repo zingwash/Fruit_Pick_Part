@@ -93,6 +93,7 @@ public sealed class TeachPendantForm : Form
     private readonly TabPage _motionPreviewPage;
     private readonly PictureBox _visionPictureBox;
     private readonly Label _visionPreviewStatusLabel;
+    private readonly Label _visionDetectionInfoLabel;
     private readonly Panel _motionPreviewHost;
     private readonly Button _homeButton;
     private readonly Button _softwareStopButton;
@@ -1144,11 +1145,12 @@ public sealed class TeachPendantForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 2,
+            RowCount = 3,
             GrowStyle = TableLayoutPanelGrowStyle.FixedSize,
             BackColor = UiTheme.DisabledSurface
         };
         visionImageLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        visionImageLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         visionImageLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         visionImageLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
         _visionPreviewStatusLabel = new Label
@@ -1156,7 +1158,17 @@ public sealed class TeachPendantForm : Form
             Text = "尚无检测画面；手动 Far/Near 显示实时 YOLO，自动任务仅保留检测截帧。",
             AutoSize = true,
             ForeColor = Color.DimGray,
-            Margin = new Padding(4, 4, 4, 6)
+            Margin = new Padding(4, 4, 4, 2)
+        };
+        _visionDetectionInfoLabel = new Label
+        {
+            Text = "",
+            AutoSize = true,
+            Font = new Font("Consolas", 10F, FontStyle.Regular),
+            ForeColor = Color.DimGray,
+            BackColor = UiTheme.DisabledSurface,
+            Margin = new Padding(4, 0, 4, 4),
+            Padding = new Padding(6, 3, 6, 3)
         };
         _visionPictureBox = new PictureBox
         {
@@ -1167,7 +1179,8 @@ public sealed class TeachPendantForm : Form
             TabStop = false
         };
         visionImageLayout.Controls.Add(_visionPreviewStatusLabel, 0, 0);
-        visionImageLayout.Controls.Add(_visionPictureBox, 0, 1);
+        visionImageLayout.Controls.Add(_visionDetectionInfoLabel, 0, 1);
+        visionImageLayout.Controls.Add(_visionPictureBox, 0, 2);
         _visionImagePage.Controls.Add(visionImageLayout);
 
         _motionPreviewHost = new Panel
@@ -3263,6 +3276,10 @@ public sealed class TeachPendantForm : Form
                             cancellationToken: ct);
                     segments++;
                     resultAvailable |= latestResult != null;
+                    if (latestResult != null)
+                    {
+                        UpdateDetectionInfoDisplay(latestResult.Targets, latestResult.SelectedIndex);
+                    }
                 }
 
                 AppendLog(operation, $"用户停止实时检测；已完成 {segments} 个连续检测片段。最后画面继续保留。");
@@ -3320,6 +3337,10 @@ public sealed class TeachPendantForm : Form
                             cancellationToken: ct);
                     segments++;
                     resultAvailable |= latestResult != null;
+                    if (latestResult != null)
+                    {
+                        UpdateDetectionInfoDisplay(latestResult.Targets, latestResult.SelectedIndex);
+                    }
                 }
 
                 AppendLog(operation, $"用户停止实时检测；已完成 {segments} 个连续检测片段。最后画面继续保留。");
@@ -3352,8 +3373,40 @@ public sealed class TeachPendantForm : Form
         _mainTabs.SelectedTab = _visionPage;
         _visionDisplayTabs.SelectedTab = _visionImagePage;
         _visionPreviewStatusLabel.Text =
-            $"{mode} 手动实时检测中：将持续运行 YOLO，点击“停止当前视觉”结束…";
+            $"{mode} 手动实时检测中：YOLO 将持续运行，点击“停止当前视觉”结束…";
         _visionPreviewStatusLabel.ForeColor = Color.DarkOrange;
+        _visionDetectionInfoLabel.Text = "";
+    }
+
+    private void UpdateDetectionInfoDisplay(IReadOnlyList<DetectedTarget> targets, int selectedIndex)
+    {
+        if (InvokeRequired)
+        {
+            BeginInvoke(new Action(() => UpdateDetectionInfoDisplay(targets, selectedIndex)));
+            return;
+        }
+
+        if (targets.Count == 0)
+        {
+            _visionDetectionInfoLabel.Text = "";
+            return;
+        }
+
+        var summaries = new List<string>();
+        foreach (DetectedTarget target in targets)
+        {
+            string selected = target.Index == selectedIndex ? " *" : "";
+            string trusted = target.Trusted ? "可信" : "待确认";
+            string className = string.IsNullOrEmpty(target.ClassName)
+                ? "未知类别"
+                : target.ClassName.StartsWith("grape_", StringComparison.Ordinal)
+                    ? target.ClassName[6..]
+                    : target.ClassName;
+            summaries.Add(
+                $"{className}#{target.Index} 置信度={target.Confidence:F3} {trusted}{selected}");
+        }
+
+        _visionDetectionInfoLabel.Text = string.Join("  |  ", summaries);
     }
 
     private async Task StopCurrentVisionAsync()

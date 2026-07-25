@@ -53,7 +53,7 @@ DEFAULT_CONF = 0.01
 DEFAULT_NEAR_TRUST_CONF = 0.2
 DEFAULT_FAR_TRUST_CONF = 0.2
 DEFAULT_IOU = 0.45
-DEFAULT_IMGSZ = 640
+DEFAULT_IMGSZ = 1280
 # 以下两项仅保留命令行参数兼容性；近端已改为 bbox 模型，实际不再使用
 DEFAULT_Z_OUTLIER_THRESHOLD_M = 0.10
 DEFAULT_CORE_POINT_RATIO_K0_TO_K2 = 0.2
@@ -330,6 +330,10 @@ class VisionWorker:
             raise RuntimeError("未获取到对齐后的 color/depth frame")
         return np.asanyarray(color_frame.get_data()).copy(), depth_frame
 
+    @staticmethod
+    def _short_class_name(class_name: str) -> str:
+        return (class_name or "").removeprefix("grape_")
+
     def _annotate_view(
         self,
         frame: np.ndarray,
@@ -355,7 +359,18 @@ class VisionWorker:
         model_name = "far_bbox" if self.latest_mode == "FAR" else "near_bbox"
         header_color = (0, 255, 0) if trusted_output else (0, 255, 255)
         self.cv2.putText(view, f"MODEL={model_name} MODE={self.latest_mode} trusted={trusted_output} selected={selected_index}", (20, 35), self.cv2.FONT_HERSHEY_SIMPLEX, 0.75, header_color, 2)
-        self.cv2.putText(view, label, (20, 68), self.cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+        class_counts: dict[str, int] = {}
+        for grape in self.latest_grapes:
+            class_name = grape.get("class_name", "")
+            if class_name:
+                short_name = self._short_class_name(class_name)
+                class_counts[short_name] = class_counts.get(short_name, 0) + 1
+        if class_counts:
+            summary = " | ".join(f"{name}:{count}" for name, count in class_counts.items())
+            self.cv2.putText(view, f"classes: {summary}", (20, 68), self.cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            self.cv2.putText(view, label, (20, 98), self.cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+        else:
+            self.cv2.putText(view, label, (20, 68), self.cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
         if self.latest_mode == "FAR":
             left = max(0, min(FAR_SAFE_CENTER_U_MIN, frame_w - 1))
@@ -363,11 +378,12 @@ class VisionWorker:
             if not use_original_coords:
                 left, right = frame_w - 1 - right, frame_w - 1 - left
             self.cv2.rectangle(view, (left, 0), (right, frame_h - 1), (255, 255, 255), 2)
-            self.cv2.putText(view, f"far safe center_u [{left},{right}]", (left + 8, 95), self.cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            self.cv2.putText(view, f"far safe center_u [{left},{right}]", (left + 8, 125), self.cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         for grape in self.latest_grapes:
             grape_index = grape.get("index")
             is_selected = selected_index is not None and grape_index == selected_index
+            short_name = self._short_class_name(grape.get("class_name", ""))
             bbox = grape.get("bbox")
             if bbox is not None:
                 xyxy = bbox.get("xyxy")
@@ -381,11 +397,11 @@ class VisionWorker:
                     x2d, y2d = display_uv(xyxy[2], xyxy[3])
                     self.cv2.rectangle(view, (x1d, y1d), (x2d, y2d), color, thickness)
                     text_x, text_y = min(x1d, x2d), min(y1d, y2d)
-                    self.cv2.putText(view, f"far#{grape_index} conf={bbox.get('confidence')}", (text_x, max(20, text_y - 8)), self.cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+                    self.cv2.putText(view, f"{short_name}#{grape_index} conf={bbox.get('confidence')}", (text_x, max(20, text_y - 8)), self.cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
                 if center_uv is not None:
                     cud, cvd = display_uv(center_uv[0], center_uv[1])
                     self.cv2.circle(view, (cud, cvd), 5, (0, 0, 255), -1)
-                    self.cv2.putText(view, f"far z={bbox.get('center_z')}", (cud + 6, cvd - 6), self.cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                    self.cv2.putText(view, f"z={bbox.get('center_z')}", (cud + 6, cvd - 6), self.cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
                 if top_center_uv is not None:
                     tud, tvd = display_uv(top_center_uv[0], top_center_uv[1])
                     self.cv2.circle(view, (tud, tvd), 6, (255, 0, 255), -1)
@@ -403,7 +419,7 @@ class VisionWorker:
                 radius = 6 if is_core else 4
                 ud, vd = display_uv(uv[0], uv[1])
                 self.cv2.circle(view, (ud, vd), radius, color, -1)
-                self.cv2.putText(view, f"near#{grape_index} {key.replace('keypoint_', 'k')}", (ud + 6, vd - 6), self.cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                self.cv2.putText(view, f"{short_name}#{grape_index} {key.replace('keypoint_', 'k')}", (ud + 6, vd - 6), self.cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
         return view
 
@@ -574,6 +590,7 @@ class VisionWorker:
 
         return {
             "index": 0,
+            "class_name": "manual_annotation",
             "trusted": trusted,
             "bbox": {
                 "xyxy": [x1i, y1i, x2i, y2i],

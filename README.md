@@ -163,6 +163,16 @@ Fruit_Pick_Part/
 
 ## 近期改动
 
+### 2026-07-26：整理并导入成员在 2026-07-25 完成的视觉与实机参数改动
+
+- 成员副本与 `baseline-2026-07-24` 完全同源，原始改动为 5 个未提交文件；本次在独立分支 `codex/member-import-20260725` 整理，未移动稳定基线标签。
+- 引入新模型 `VisionPython/models/best_20260725.pt`。模型类别经实际读取确认为 `grape_XiaHei`、`grape_YangGuangMeiGui`；权重由 `.gitignore` 排除，文件大小和 SHA-256 记录在 [VisionPython/MODEL_MANIFEST.md](VisionPython/MODEL_MANIFEST.md)。
+- Far/Near worker 默认推理尺寸从 640 调整为 1280；新模型 Near/Far 信任阈值分别为 0.6/0.7。C# 显式按 UTF-8 读取 Python 标准输出和错误输出。
+- 检测结果补充 `class_name`，Python 标注画面和桌面视觉区会显示葡萄类别、序号、置信度、可信状态及当前选中目标。桌面新增信息行继续使用原灰白主题，没有恢复黑色背景。
+- 新类别筛选同时兼容旧模型的 `grape_far`、`grape_close`，避免回退旧权重后完全检测不到目标。
+- 同步成员实机参数：Home 关节角、Far/Near 速度、Near 选择权重、TCP 插入深度、最大工具 Z 前伸距离和新的放置点。由于这些参数会直接影响真实机械臂路径，合入 `main` 前必须逐项进行低速现场确认。
+- 整理时保留中文界面文字，并清除了成员配置中的尾随空格和行内格式问题。
+
 ### 2026-07-24：修复手动 Far/Near 实时检测偶发无法停止
 
 - 根因是旧停止流程只能等待当前 D435 取帧/YOLO 检测片段自然返回；相机取帧超时或推理耗时异常时，普通请求信号量一直被占用，后续 `shutdown` 只能等待并最终强制终止。

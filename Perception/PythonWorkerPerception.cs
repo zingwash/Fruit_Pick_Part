@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
 using FruitPickPart.Configuration;
 
@@ -131,10 +132,14 @@ public sealed class PythonWorkerPerception : IPerception
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
             UseShellExecute = false,
             CreateNoWindow = createNoWindow,
             WorkingDirectory = resources.WorkingDirectory
         };
+        psi.Environment["PYTHONIOENCODING"] = "utf-8";
+        psi.Environment["PYTHONUTF8"] = "1";
 
         _process = Process.Start(psi) ?? throw new InvalidOperationException("无法启动 Python worker 进程。");
         _writer = _process.StandardInput;
