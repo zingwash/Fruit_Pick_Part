@@ -155,7 +155,7 @@ internal sealed class MotionPreviewControl : Forms.UserControl
         timelinePanel.ColumnStyles.Add(new Forms.ColumnStyle(Forms.SizeType.AutoSize));
         timelinePanel.ColumnStyles.Add(new Forms.ColumnStyle(Forms.SizeType.Percent, 100));
         timelinePanel.ColumnStyles.Add(new Forms.ColumnStyle(Forms.SizeType.AutoSize));
-        _playButton = new Forms.Button { Text = "▶ 播放预览", AutoSize = true, Margin = new Forms.Padding(4) };
+        _playButton = new ThemeButton { Text = "▶ 播放预览", AutoSize = true, Margin = new Forms.Padding(4) };
         _playButton.Click += (_, _) => TogglePlayback();
         _timeline = new Forms.TrackBar
         {
@@ -201,7 +201,7 @@ internal sealed class MotionPreviewControl : Forms.UserControl
             Font = new Drawing.Font(Font, Drawing.FontStyle.Bold),
             Margin = new Forms.Padding(4, 12, 8, 4)
         };
-        _approveButton = new Forms.Button
+        _approveButton = new ThemeButton
         {
             Text = "确认执行本步真实运动",
             AutoSize = true,
@@ -212,7 +212,7 @@ internal sealed class MotionPreviewControl : Forms.UserControl
             Font = new Drawing.Font(Font.FontFamily, 10.5F, Drawing.FontStyle.Bold),
             Margin = new Forms.Padding(4)
         };
-        _cancelButton = new Forms.Button
+        _cancelButton = new ThemeButton
         {
             Text = "取消本步并终止任务",
             AutoSize = true,

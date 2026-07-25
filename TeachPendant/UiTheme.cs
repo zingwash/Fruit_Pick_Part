@@ -2,7 +2,8 @@ namespace TeachPendant;
 
 /// <summary>
 /// 全局 UI 主题：统一配色与常用控件样式。
-/// 浅色背景 + 白色卡片，语义色：蓝=主要操作，绿=执行，红=危险。
+/// 浅色背景 + 白色卡片，语义色：蓝=主要操作/任务执行，红=危险。
+/// 绿色仅用于成功、已连接等状态提示，不作为按钮背景。
 /// </summary>
 internal static class UiTheme
 {
@@ -12,9 +13,9 @@ internal static class UiTheme
     public static Color AccentHover => Color.FromArgb(0x4A, 0x83, 0xE8);
     public static Color AccentPressed => Color.FromArgb(0x24, 0x55, 0xB8);
 
-    public static Color Execute => Color.FromArgb(0x2E, 0x9E, 0x5B);
-    public static Color ExecuteHover => Color.FromArgb(0x40, 0xB5, 0x6F);
-    public static Color ExecutePressed => Color.FromArgb(0x24, 0x80, 0x4A);
+    public static Color Execute => Accent;
+    public static Color ExecuteHover => AccentHover;
+    public static Color ExecutePressed => AccentPressed;
 
     public static Color Danger => Color.FromArgb(0xD6, 0x45, 0x45);
     public static Color DangerHover => Color.FromArgb(0xE0, 0x5C, 0x5C);

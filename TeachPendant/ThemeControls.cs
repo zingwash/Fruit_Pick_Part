@@ -106,6 +106,12 @@ internal sealed class ThemeButton : Button
 
     protected override void OnEnabledChanged(EventArgs e)
     {
+        if (!Enabled)
+        {
+            _hover = false;
+            _pressed = false;
+        }
+        Cursor = Enabled ? Cursors.Hand : Cursors.Default;
         Invalidate();
         base.OnEnabledChanged(e);
     }

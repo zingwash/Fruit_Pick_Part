@@ -2379,7 +2379,7 @@ public sealed class TeachPendantForm : Form
         Margin = new Padding(3)
     };
 
-    private static Button MakeAutoSizeButton(string text, int minimumWidth) => new()
+    private static Button MakeAutoSizeButton(string text, int minimumWidth) => new ThemeButton
     {
         Text = text,
         AutoSize = true,
