@@ -165,7 +165,8 @@ Fruit_Pick_Part/
 
 ### 2026-07-26：整理并导入成员在 2026-07-25 完成的视觉与实机参数改动
 
-- 成员副本与 `baseline-2026-07-24` 完全同源，原始改动为 5 个未提交文件；本次在独立分支 `codex/member-import-20260725` 整理，未移动稳定基线标签。
+- 该整理版已接受为新的当前基准：稳定维护分支 `codex/baseline-stable` 和标签 `baseline-2026-07-26`；原标签 `baseline-2026-07-24` 保留为覆盖前回退点。
+- 成员副本与 `baseline-2026-07-24` 完全同源，原始改动为 5 个未提交文件；本次先在独立分支 `codex/member-import-20260725` 整理，且没有移动或覆盖原始基线标签。
 - 引入新模型 `VisionPython/models/best_20260725.pt`。模型类别经实际读取确认为 `grape_XiaHei`、`grape_YangGuangMeiGui`；权重由 `.gitignore` 排除，文件大小和 SHA-256 记录在 [VisionPython/MODEL_MANIFEST.md](VisionPython/MODEL_MANIFEST.md)。
 - Far/Near worker 默认推理尺寸从 640 调整为 1280；新模型 Near/Far 信任阈值分别为 0.6/0.7。C# 显式按 UTF-8 读取 Python 标准输出和错误输出。
 - 检测结果补充 `class_name`，Python 标注画面和桌面视觉区会显示葡萄类别、序号、置信度、可信状态及当前选中目标。桌面新增信息行继续使用原灰白主题，没有恢复黑色背景。
